@@ -5,7 +5,7 @@ THEOS_PACKAGE_SCHEME = rootless
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = RivoVPNAD
-RivoVPNAD_FILES = Tweak.x
+RivoVPNAD_FILES = Tweak.x fishhook.c
 RivoVPNAD_CFLAGS = -fobjc-arc
 RivoVPNAD_LDFLAGS = -Wl,-undefined,dynamic_lookup
 
