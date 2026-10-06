@@ -191,6 +191,8 @@ static void rivoHandleConfig(NSString *configJson, NSString *source) {
                       (unsigned long)[configJson lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
         return;
     }
+    if (rivoConfigHandled) return;   // 同会话成功过一次就不再重复弹窗
+    rivoConfigHandled = YES;
     NSString *subText = [uris componentsJoinedByString:@"\n"];
     NSData *subData = [subText dataUsingEncoding:NSUTF8StringEncoding];
     NSString *subB64 = [[subData base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
@@ -417,6 +419,11 @@ static id rivoDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
 
 #pragma mark - NSJSONSerialization hook（明文节点 JSON 必经之路）
 
+// 重入保护：rivoHandleConfig 内部解析会再次调用 NSJSONSerialization，
+// 必须跳过自身 hook，否则无限递归栈溢出崩溃（v6.3 闪退根因）
+static int rivoJSONReentry = 0;
+static BOOL rivoConfigHandled = NO;   // 同会话只处理一次，避免重复弹窗
+
 static BOOL rivoLooksLikeConfigString(NSString *s) {
     if (s.length < 120) return NO;
     NSString *low = [s lowercaseString];
@@ -431,14 +438,18 @@ static NSData *(*orig_NSJSON_dataWithJSONObject)(Class, SEL, id, NSJSONWritingOp
 static NSData *rivo_NSJSON_dataWithJSONObject(Class cls, SEL _cmd, id obj, NSJSONWritingOptions opt, NSError **err) {
     NSData *data = orig_NSJSON_dataWithJSONObject(cls, _cmd, obj, opt, err);
     @try {
-        if (data.length > 120) {
+        if (data.length > 120 && rivoJSONReentry == 0 && !rivoConfigHandled) {
+            rivoJSONReentry++;
             NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
             if (rivoLooksLikeConfigString(s)) {
                 rivoAppendLog(@"NSJSONSerialization serialize captured (%lu bytes)", (unsigned long)data.length);
                 rivoHandleConfig(s, @"NSJSONSerialization serialize");
             }
+            rivoJSONReentry--;
         }
-    } @catch (NSException *e) {}
+    } @catch (NSException *e) {
+        rivoJSONReentry = 0;
+    }
     return data;
 }
 
@@ -446,14 +457,18 @@ static id (*orig_NSJSON_JSONObjectWithData)(Class, SEL, NSData *, NSJSONReadingO
 
 static id rivo_NSJSON_JSONObjectWithData(Class cls, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **err) {
     @try {
-        if (data.length > 120) {
+        if (data.length > 120 && rivoJSONReentry == 0 && !rivoConfigHandled) {
+            rivoJSONReentry++;
             NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
             if (rivoLooksLikeConfigString(s)) {
                 rivoAppendLog(@"NSJSONSerialization parse captured (%lu bytes)", (unsigned long)data.length);
                 rivoHandleConfig(s, @"NSJSONSerialization parse");
             }
+            rivoJSONReentry--;
         }
-    } @catch (NSException *e) {}
+    } @catch (NSException *e) {
+        rivoJSONReentry = 0;
+    }
     return orig_NSJSON_JSONObjectWithData(cls, _cmd, data, opt, err);
 }
 
