@@ -176,6 +176,10 @@ static void rivoShowAlert(NSString *title, NSString *msg) {
     });
 }
 
+// 节点/重入全局标志（必须在 rivoHandleConfig 之前声明）
+static int rivoJSONReentry = 0;        // NSJSONSerialization hook 重入保护
+static BOOL rivoConfigHandled = NO;    // 同会话成功解析过节点则不再重复弹窗
+
 static void rivoHandleConfig(NSString *configJson, NSString *source) {
     if (!configJson.length) return;
     NSString *home = NSHomeDirectory();
@@ -419,10 +423,7 @@ static id rivoDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
 
 #pragma mark - NSJSONSerialization hook（明文节点 JSON 必经之路）
 
-// 重入保护：rivoHandleConfig 内部解析会再次调用 NSJSONSerialization，
-// 必须跳过自身 hook，否则无限递归栈溢出崩溃（v6.3 闪退根因）
-static int rivoJSONReentry = 0;
-static BOOL rivoConfigHandled = NO;   // 同会话只处理一次，避免重复弹窗
+// （rivoJSONReentry / rivoConfigHandled 已在前文声明，避免前向使用编译错误）
 
 static BOOL rivoLooksLikeConfigString(NSString *s) {
     if (s.length < 120) return NO;
