@@ -84,7 +84,7 @@ static NSString *rivoURIFromDict(NSDictionary *d) {
     }
     if (passwd && method) {
         // Shadowsocks
-        NSString *userinfo = [[NSString stringWithFormat:@"%@:%@", method, passwd] dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *userinfo = [[NSString stringWithFormat:@"%@:%@", method, passwd] dataUsingEncoding:NSUTF8StringEncoding];
         NSString *uiB64 = [[userinfo base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
         return [NSString stringWithFormat:@"ss://%@@%@:%@#%@", uiB64, host, port, nameB64];
     }
@@ -123,7 +123,10 @@ static void rivoCollectNodes(id obj, NSMutableArray *uris, int depth) {
 static void rivoShowAlert(NSString *title, NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIApplication *app = [UIApplication sharedApplication];
-        UIWindow *win = app.keyWindow;
+        UIWindow *win = nil;
+        for (UIWindow *w in app.windows) {
+            if (w.isKeyWindow) { win = w; break; }
+        }
         if (!win) win = app.windows.firstObject;
         UIViewController *root = win.rootViewController;
         if (!root) return;
