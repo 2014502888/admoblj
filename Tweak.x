@@ -2,7 +2,9 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// ===== RivoVPNAD v5: 全广告SDK hook(AdMob+UnityAds+Vungle) + NSURLProtocol节点抓取 =====
+// ===== RivoVPNAD v6: 广告hook保留 + NSURLProtocol抓取 + LibboxSetup明文配置抓取 =====
+// v6 新增：hook sing-box gomobile 的 LibboxSetup，抓 options.baseConfig（完整明文配置 JSON，
+// 含全部 outbounds 节点），落盘 rivo_config.json 供验证；同时生成 Shadowrocket 订阅。
 
 #pragma mark - 工具函数
 
@@ -26,73 +28,102 @@ static BOOL rivoIsTargetURL(NSString *url) {
            [url containsString:@"flag.rivovpn"];
 }
 
-// 把单个节点字典转成 Shadowrocket URI
-static NSString *rivoURIFromDict(NSDictionary *d) {
-    NSString *name = d[@"name"] ?: d[@"remark"] ?: d[@"title"] ?: d[@"ps"] ?: @"rivo";
-    NSString *host = d[@"server"] ?: d[@"host"] ?: d[@"address"] ?: d[@"addr"] ?: d[@"ip"];
-    NSNumber *portN = d[@"port"];
-    if (!host || !portN) return nil;
-    NSString *port = [portN stringValue];
-    NSString *uuid = d[@"uuid"] ?: d[@"id"] ?: d[@"password"];
-    NSString *method = d[@"method"] ?: d[@"cipher"] ?: @"aes-128-gcm";
-    NSString *passwd = d[@"password"] ?: d[@"key"];
-    NSString *sni = d[@"sni"] ?: d[@"servername"] ?: d[@"serverName"] ?: d[@"host"];
-    NSNumber *alterId = d[@"alterId"] ?: d[@"aid"];
-
-    NSData *nameData = [name dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *nameB64 = [nameData base64EncodedStringWithOptions:0];
-
-    if (uuid && passwd && [passwd length] > 0) {
-        NSString *tp = [NSString stringWithFormat:@"%@:%@@%@:%@?peer=%@#%@",
-                        uuid, passwd, host, port, sni ?: @"", nameB64];
-        return [@"trojan://" stringByAppendingString:tp];
-    }
-    if (uuid) {
-        if (alterId && [alterId intValue] > 0) {
-            NSString *payload = [NSString stringWithFormat:@"%@:%@@%@:%@", uuid, method, host, port];
-            NSDictionary *extra = @{@"alterId": alterId, @"sni": sni ?: @"", @"type": @"none"};
-            NSData *jData = [NSJSONSerialization dataWithJSONObject:extra options:0 error:nil];
-            NSString *jB64 = [[jData base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
-            NSString *vp = [NSString stringWithFormat:@"%@?remarks=%@&obfsParam=%@", payload, nameB64, jB64];
-            return [@"vmess://" stringByAppendingString:vp];
+static void rivoAppendLog(NSString *line) {
+    @try {
+        NSString *home = NSHomeDirectory();
+        NSString *logPath = [home stringByAppendingPathComponent:@"Documents/rivo_debug.log"];
+        NSString *stamp = [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                         dateStyle:NSDateFormatterShortStyle
+                                                         timeStyle:NSDateFormatterMediumStyle];
+        NSString *entry = [NSString stringWithFormat:@"[%@] %@\n", stamp, line];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (!fh) {
+            [entry writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
         }
-        NSString *vp = [NSString stringWithFormat:@"%@:%@@%@:%@?encryption=none&security=tls&sni=%@#%@",
-                        uuid, @"", host, port, sni ?: @"", nameB64];
-        return [@"vless://" stringByAppendingString:vp];
+    } @catch (NSException *e) {
     }
-    if (passwd && method) {
-        NSData *userinfo = [[NSString stringWithFormat:@"%@:%@", method, passwd] dataUsingEncoding:NSUTF8StringEncoding];
-        NSString *uiB64 = [[userinfo base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
-        return [NSString stringWithFormat:@"ss://%@@%@:%@#%@", uiB64, host, port, nameB64];
+}
+
+// 转码 base64 的 tag 名（Shadowrocket 兼容）
+static NSString *rivoTagName(NSString *name) {
+    if (!name.length) name = @"rivo";
+    NSData *d = [name dataUsingEncoding:NSUTF8StringEncoding];
+    return [d base64EncodedStringWithOptions:0];
+}
+
+// sing-box outbound 字典 -> Shadowrocket URI
+static NSString *rivoURIFromSingbox(NSDictionary *d) {
+    NSString *type = d[@"type"];
+    if (!type) return nil;
+    if ([type isEqualToString:@"selector"] || [type isEqualToString:@"urltest"] ||
+        [type isEqualToString:@"direct"] || [type isEqualToString:@"block"] ||
+        [type isEqualToString:@"dns"] || [type isEqualToString:@"reject"] ||
+        [type isEqualToString:@"loopback"] || [type isEqualToString:@"wireguard"] ||
+        [type isEqualToString:@"hysteria2"] || [type isEqualToString:@"tuic"] ||
+        [type isEqualToString:@"http"] || [type isEqualToString:@"socks"] ||
+        [type isEqualToString:@"shadowtls"]) {
+        return nil;
+    }
+    NSString *server = d[@"server"];
+    NSNumber *portN = d[@"server_port"] ?: d[@"port"];
+    if (!server || !portN) return nil;
+    NSString *port = [portN stringValue];
+    NSString *name = rivoTagName(d[@"tag"] ?: @"rivo");
+    NSDictionary *tls = d[@"tls"];
+    NSString *sni = tls[@"server_name"] ?: tls[@"serverName"];
+    NSString *uuid = d[@"uuid"];
+    NSString *password = d[@"password"];
+    NSString *method = d[@"method"] ?: @"aes-128-gcm";
+
+    if ([type isEqualToString:@"vless"]) {
+        NSString *flow = d[@"flow"];
+        NSString *q = [NSString stringWithFormat:@"encryption=none&security=tls&sni=%@&fp=chrome&type=tcp",
+                       sni ?: @""];
+        if (flow.length) q = [q stringByAppendingFormat:@"&flow=%@", flow];
+        return [NSString stringWithFormat:@"vless://%@@@%@:%@?%@#%@", uuid ?: @"", server, port, q, name];
+    }
+    if ([type isEqualToString:@"vmess"]) {
+        NSDictionary *vm = @{
+            @"v": @"2", @"ps": d[@"tag"] ?: @"rivo", @"add": server, @"port": port,
+            @"id": uuid ?: @"", @"aid": d[@"alter_id"] ?: d[@"alterId"] ?: @"0",
+            @"net": d[@"transport"] ?: @"tcp", @"type": @"none",
+            @"host": sni ?: @"", @"path": @"", @"tls": ([tls[@"enabled"] boolValue] ? @"tls" : @"")
+        };
+        NSData *j = [NSJSONSerialization dataWithJSONObject:vm options:0 error:nil];
+        NSString *b64 = [[j base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
+        return [@"vmess://" stringByAppendingString:b64];
+    }
+    if ([type isEqualToString:@"trojan"]) {
+        return [NSString stringWithFormat:@"trojan://%@@%@:%@?security=tls&sni=%@#%@",
+                password ?: @"", server, port, sni ?: @"", name];
+    }
+    if ([type isEqualToString:@"shadowsocks"]) {
+        NSData *ui = [[NSString stringWithFormat:@"%@:%@", method, password ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *b64 = [[ui base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
+        return [NSString stringWithFormat:@"ss://%@@%@:%@#%@", b64, server, port, name];
     }
     return nil;
 }
 
-// 递归收集节点
-static void rivoCollectNodes(id obj, NSMutableArray *uris, int depth) {
-    if (!obj || depth > 6) return;
-    if ([obj isKindOfClass:[NSArray class]]) {
-        for (id item in (NSArray *)obj) {
-            rivoCollectNodes(item, uris, depth + 1);
-        }
-    } else if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *d = (NSDictionary *)obj;
-        for (NSString *key in @[@"outbounds", @"nodes", @"servers", @"serverList", @"list", @"proxies", @"configs", @"data", @"subs", @"groups"]) {
-            id val = d[key];
-            if ([val isKindOfClass:[NSArray class]]) {
-                for (id item in (NSArray *)val) {
-                    if ([item isKindOfClass:[NSDictionary class]]) {
-                        NSString *uri = rivoURIFromDict((NSDictionary *)item);
-                        if (uri) [uris addObject:uri];
-                    } else {
-                        rivoCollectNodes(item, uris, depth + 1);
-                    }
-                }
-            }
-        }
-        NSString *uri = rivoURIFromDict(d);
+// 从 sing-box 配置 JSON 提取节点
+static NSArray *rivoURIsFromConfig(NSString *json) {
+    NSMutableArray *uris = [NSMutableArray array];
+    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *err = nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (err || !obj || ![obj isKindOfClass:[NSDictionary class]]) return uris;
+    id outbounds = ((NSDictionary *)obj)[@"outbounds"];
+    if (![outbounds isKindOfClass:[NSArray class]]) return uris;
+    for (id item in (NSArray *)outbounds) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *uri = rivoURIFromSingbox((NSDictionary *)item);
         if (uri && ![uris containsObject:uri]) [uris addObject:uri];
     }
+    return uris;
 }
 
 static void rivoShowAlert(NSString *title, NSString *msg) {
@@ -111,38 +142,87 @@ static void rivoShowAlert(NSString *title, NSString *msg) {
     });
 }
 
-static void rivoSaveNodes(NSData *data, NSString *url) {
-    if (!data.length) return;
-    NSError *err = nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
-    if (err || !obj) return;
-    NSMutableArray *uris = [NSMutableArray array];
-    rivoCollectNodes(obj, uris, 0);
-
+static void rivoHandleConfig(NSString *configJson, NSString *source) {
+    if (!configJson.length) return;
     NSString *home = NSHomeDirectory();
     NSString *docDir = [home stringByAppendingPathComponent:@"Documents"];
-    NSString *rawPath = [docDir stringByAppendingPathComponent:@"rivo_nodes_raw.json"];
-    [data writeToFile:rawPath atomically:YES];
+    [configJson writeToFile:[docDir stringByAppendingPathComponent:@"rivo_config.json"]
+                 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    rivoAppendLog([NSString stringWithFormat:@"captured config from %@, %lu bytes",
+                   source, (unsigned long)[configJson lengthOfBytesUsingEncoding:NSUTF8StringEncoding]]);
 
-    if (uris.count == 0) {
-        NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        pb.string = raw;
-        rivoShowAlert(@"RivoVPNAD", [NSString stringWithFormat:@"已复制原始数据(%lu字节)到剪贴板，节点结构待适配\n%@", (unsigned long)data.length, url]);
+    NSArray *uris = rivoURIsFromConfig(configJson);
+    if (!uris.count) {
+        rivoAppendLog(@"no node uris parsed from config (outbounds missing or unsupported types)");
         return;
     }
-
     NSString *subText = [uris componentsJoinedByString:@"\n"];
     NSData *subData = [subText dataUsingEncoding:NSUTF8StringEncoding];
     NSString *subB64 = [[subData base64EncodedStringWithOptions:0] stringByReplacingOccurrencesOfString:@"=" withString:@""];
     NSString *subLink = [@"sub://" stringByAppendingString:subB64];
-
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
     pb.string = subLink;
+    [subText writeToFile:[docDir stringByAppendingPathComponent:@"rivo_sub.txt"]
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    rivoAppendLog([NSString stringWithFormat:@"parsed %lu nodes, sub copied", (unsigned long)uris.count]);
+    rivoShowAlert(@"RivoVPNAD", [NSString stringWithFormat:@"已从明文配置抓到 %lu 个节点，订阅已复制到剪贴板", (unsigned long)uris.count]);
+}
 
-    [subText writeToFile:[docDir stringByAppendingPathComponent:@"rivo_sub.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+#pragma mark - LibboxSetup hook（sing-box gomobile 配置入口）
 
-    rivoShowAlert(@"RivoVPNAD", [NSString stringWithFormat:@"已抓取 %lu 个节点，订阅链接已复制到剪贴板\nShadowrocket 中粘贴即可导入", (unsigned long)uris.count]);
+static IMP origSetupIMP = NULL;
+
+// gomobile 对 func Setup(options *SetupOptions) error 通常导出 +setupWithOptions:error:
+static id rivoSetupHook(id self, SEL _cmd, id options, id error) {
+    @try {
+        NSString *cfg = nil;
+        @try { cfg = [options valueForKey:@"baseConfig"]; } @catch (NSException *e) {}
+        if (cfg.length) {
+            rivoHandleConfig(cfg, @"LibboxSetup.baseConfig");
+        } else {
+            rivoAppendLog(@"LibboxSetup called but baseConfig empty; options class: %@",
+                          NSStringFromClass([options class]));
+        }
+    } @catch (NSException *e) {
+        rivoAppendLog([NSString stringWithFormat:@"setup hook exception: %@", e.reason]);
+    }
+    if (origSetupIMP) {
+        return ((id (*)(id, SEL, id, id))origSetupIMP)(self, _cmd, options, error);
+    }
+    return nil;
+}
+
+static void rivoHookLibboxSetup(void) {
+    Class setup = NSClassFromString(@"LibboxSetup");
+    if (!setup) {
+        rivoAppendLog(@"LibboxSetup class not found");
+        return;
+    }
+    SEL sel = NSSelectorFromString(@"setupWithOptions:error:");
+    Method m = class_getClassMethod(setup, sel);
+    if (!m) {
+        // 备选：无 error 变体
+        sel = NSSelectorFromString(@"setupWithOptions:");
+        m = class_getClassMethod(setup, sel);
+    }
+    if (m) {
+        origSetupIMP = method_getImplementation(m);
+        method_setImplementation(m, (IMP)rivoSetupHook);
+        rivoAppendLog(@"LibboxSetup hooked (selector %@)", NSStringFromSelector(sel));
+    } else {
+        rivoAppendLog(@"LibboxSetup found but no setupWithOptions selector; trying init variants");
+        // 实例方法兜底
+        SEL sel2 = NSSelectorFromString(@"initWithOptions:error:");
+        Method m2 = class_getInstanceMethod(setup, sel2);
+        if (!m2) { sel2 = NSSelectorFromString(@"initWithOptions:"); m2 = class_getInstanceMethod(setup, sel2); }
+        if (m2) {
+            origSetupIMP = method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)rivoSetupHook);
+            rivoAppendLog(@"LibboxSetup init hooked (selector %@)", NSStringFromSelector(sel2));
+        } else {
+            rivoAppendLog(@"LibboxSetup no hookable selector found");
+        }
+    }
 }
 
 #pragma mark - 广告 hook（AdMob：加载直接失败）
@@ -158,8 +238,6 @@ static void rivoEmptyBannerLoad(id self, SEL _cmd, id request) {
 #pragma mark - Unity Ads：load 直接失败（触发 App 免费解锁兜底）
 
 static void rivoUnityLoadFail(id self, SEL _cmd, NSString *placementId, id delegate) {
-    // UnityAdsLoadError NO_FILL = 3，让 App 收到"广告无填充"→触发免费解锁
-    // 用 objc_msgSend 直接发消息（避免编译器不认识 UnityAds 协议 selector）
     SEL failSel = NSSelectorFromString(@"unityAdsLoadFailed:withError:withMessage:");
     if (delegate && [delegate respondsToSelector:failSel]) {
         ((void (*)(id, SEL, id, NSInteger, id))objc_msgSend)(delegate, failSel, placementId, 3, @"No fill (blocked by RivoVPNAD)");
@@ -191,7 +269,7 @@ static void rivoAddSubview(id self, SEL _cmd, id view) {
     }
 }
 
-#pragma mark - 节点抓取（主方案：NSURLProtocol 拦 URLSession 全部请求）
+#pragma mark - 节点抓取（NSURLProtocol 拦 URLSession 全部请求，兜底记录响应）
 
 @interface RivoURLProtocol : NSURLProtocol
 @end
@@ -199,7 +277,6 @@ static void rivoAddSubview(id self, SEL _cmd, id view) {
 @implementation RivoURLProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    // 已由本协议转发的请求跳过，防止死循环
     if ([NSURLProtocol propertyForKey:@"RivoAlreadyFetched" inRequest:request]) return NO;
     return rivoIsTargetURL(request.URL.absoluteString);
 }
@@ -216,7 +293,26 @@ static void rivoAddSubview(id self, SEL _cmd, id view) {
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
     NSURLSessionDataTask *task = [session dataTaskWithRequest:newReq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (data.length) {
-            rivoSaveNodes(data, self.request.URL.absoluteString);
+            rivoAppendLog([NSString stringWithFormat:@"response %lu bytes from %@",
+                           (unsigned long)data.length, self.request.URL.absoluteString]);
+            // 若响应本身就是明文配置 JSON，直接尝试解析；否则原样落盘
+            NSError *jerr = nil;
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jerr];
+            if (!jerr && obj && [obj isKindOfClass:[NSDictionary class]]) {
+                NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                NSArray *uris = rivoURIsFromConfig(json);
+                if (uris.count) {
+                    rivoHandleConfig(json, @"http response");
+                } else {
+                    NSString *home = NSHomeDirectory();
+                    NSString *rawPath = [home stringByAppendingPathComponent:@"Documents/rivo_nodes_raw.json"];
+                    [data writeToFile:rawPath atomically:YES];
+                }
+            } else {
+                NSString *home = NSHomeDirectory();
+                NSString *rawPath = [home stringByAppendingPathComponent:@"Documents/rivo_nodes_raw.json"];
+                [data writeToFile:rawPath atomically:YES];
+            }
         }
         if (err) {
             [self.client URLProtocol:self didFailWithError:err];
@@ -234,7 +330,7 @@ static void rivoAddSubview(id self, SEL _cmd, id view) {
 
 @end
 
-#pragma mark - 备用：NSURLSession dataTask hook（部分场景不走 NSURLProtocol）
+#pragma mark - 备用：NSURLSession dataTask hook
 
 static IMP origDataTaskIMP = NULL;
 
@@ -244,7 +340,13 @@ static id rivoDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
         void (^origComp)(NSData *, NSURLResponse *, NSError *) = completion;
         void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
             if (origComp) origComp(data, resp, err);
-            if (data.length) rivoSaveNodes(data, u);
+            if (data.length) {
+                NSString *home = NSHomeDirectory();
+                NSString *rawPath = [home stringByAppendingPathComponent:@"Documents/rivo_nodes_raw.json"];
+                [data writeToFile:rawPath atomically:YES];
+                rivoAppendLog([NSString stringWithFormat:@"dataTask response %lu bytes from %@",
+                               (unsigned long)data.length, u]);
+            }
         };
         return ((id (*)(id, SEL, id, id))origDataTaskIMP)(self, _cmd, req, wrapped);
     }
@@ -296,7 +398,7 @@ static void rivoDoHook(void) {
         if (mv) method_setImplementation(mv, (IMP)rivoVungleLoadFail);
     }
 
-    // 4) 展示层兜底：GAD/Unity 视图挂载即隐藏（先保存原 IMP 再替换）
+    // 4) 展示层兜底：GAD/Unity 视图挂载即隐藏
     Method ma = class_getInstanceMethod([UIView class], @selector(addSubview:));
     if (ma) {
         origAddSubviewIMP = method_getImplementation(ma);
@@ -312,12 +414,20 @@ static void rivoDoHook(void) {
         origDataTaskIMP = method_getImplementation(md);
         method_setImplementation(md, (IMP)rivoDataTask);
     }
+
+    // 7) v6 新增：LibboxSetup 明文配置抓取
+    rivoHookLibboxSetup();
 }
 
 static void rivoTryHook(int attempt) {
     Class gRew = NSClassFromString(@"GADRewardedAd");
     Class unityAds = NSClassFromString(@"UnityAds");
-    if (gRew || unityAds || attempt >= 15) {
+    Class setup = NSClassFromString(@"LibboxSetup");
+    if ((gRew || unityAds || setup) && attempt >= 2) {
+        rivoDoHook();
+        return;
+    }
+    if (attempt >= 20) {
         rivoDoHook();
         return;
     }
