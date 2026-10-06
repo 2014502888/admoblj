@@ -4,6 +4,7 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import <dlfcn.h>
 #import <string.h>
+#import <mach/mach.h>
 #include "fishhook.h"
 
 // ===== RivoVPNAD v6.2: fishhook CCCrypt 解密抓取 + 广告hook保留 + 响应按URL分存 =====
@@ -443,12 +444,17 @@ static id rivoDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
 // （rivoJSONReentry / rivoConfigHandled 已在前文声明，避免前向使用编译错误）
 
 static BOOL rivoLooksLikeConfigString(NSString *s) {
-    if (s.length < 120) return NO;
+    if (s.length < 80) return NO;
     NSString *low = [s lowercaseString];
-    return [low containsString:@"\"server\""] ||
-           [low containsString:@"outbounds"] ||
-           ([low containsString:@"uuid"] && [low containsString:@"server_port"]) ||
-           ([low containsString:@"rivo"] && [low containsString:@"server"]);
+    // 加严：必须有明确的节点/配置特征，避免 AdMob gcache（"Server":"gvs"）误判
+    return [low containsString:@"outbounds"] ||
+           ([low containsString:@"\"uuid\""] && [low containsString:@"server_port"]) ||
+           [low containsString:@"\"type\":\"vless\""] ||
+           [low containsString:@"\"type\":\"vmess\""] ||
+           [low containsString:@"\"type\":\"trojan\""] ||
+           [low containsString:@"\"type\":\"shadowsocks\""] ||
+           ([low containsString:@"\"server\""] && [low containsString:@"\"tag\""] &&
+            [low containsString:@"\"port\""]);
 }
 
 static NSData *(*orig_NSJSON_dataWithJSONObject)(Class, SEL, id, NSJSONWritingOptions, NSError **);
@@ -502,6 +508,143 @@ static void rivoHookNSJSON(void) {
         method_setImplementation(m2, (IMP)rivo_NSJSON_JSONObjectWithData);
     }
     rivoAppendLog(@"NSJSONSerialization hooks installed");
+}
+
+#pragma mark - 分步 CommonCrypto hook（CCCryptor*，Swift/CryptoKit 常用分步解密，CCCrypt 抓不到）
+
+static void rivoCheckDecryptOutput(const void *out, size_t len) {
+    if (!out || len < 80) return;
+    NSString *str = [[NSString alloc] initWithBytes:out length:len encoding:NSUTF8StringEncoding];
+    if (rivoLooksLikeConfigString(str)) {
+        rivoAppendLog(@"CCCryptor decrypt output captured (%zu bytes)", len);
+        rivoHandleConfig(str, @"CCCryptor* decrypt");
+    }
+}
+
+// CCCryptorCreateWithMode
+static CCCryptorStatus (*orig_CCCryptorCreateWithMode)(CCOperation, CCMode, CCAlgorithm, CCPadding,
+                                                       const void *, size_t, const void *, size_t, const void *,
+                                                       int, CCModeOptions, CCCryptorRef *);
+static CCCryptorStatus rivo_CCCryptorCreateWithMode(CCOperation op, CCMode mode, CCAlgorithm alg, CCPadding pad,
+                                                    const void *iv, size_t keyLength, const void *key,
+                                                    size_t tweakLength, const void *tweak,
+                                                    int numRounds, CCModeOptions options, CCCryptorRef *ref) {
+    CCCryptorStatus st = orig_CCCryptorCreateWithMode(op, mode, alg, pad, iv, keyLength, key,
+                                                      tweakLength, tweak, numRounds, options, ref);
+    if (st == kCCSuccess && ref && *ref && op == kCCDecrypt) {
+        rivoAppendLog(@"CCCryptorCreateWithMode decrypt created (alg=%d mode=%d)", (int)alg, (int)mode);
+    }
+    return st;
+}
+
+// CCCryptorUpdate
+static CCCryptorStatus (*orig_CCCryptorUpdate)(CCCryptorRef, const void *, size_t, void *, size_t, size_t *);
+static CCCryptorStatus rivo_CCCryptorUpdate(CCCryptorRef ref, const void *in, size_t inLen,
+                                            void *out, size_t outAvail, size_t *outMoved) {
+    CCCryptorStatus st = orig_CCCryptorUpdate(ref, in, inLen, out, outAvail, outMoved);
+    if (st == kCCSuccess && out && outMoved && *outMoved > 80) {
+        rivoCheckDecryptOutput(out, *outMoved);
+    }
+    return st;
+}
+
+// CCCryptorFinal
+static CCCryptorStatus (*orig_CCCryptorFinal)(CCCryptorRef, void *, size_t, size_t *);
+static CCCryptorStatus rivo_CCCryptorFinal(CCCryptorRef ref, void *out, size_t outAvail, size_t *outMoved) {
+    CCCryptorStatus st = orig_CCCryptorFinal(ref, out, outAvail, outMoved);
+    if (st == kCCSuccess && out && outMoved && *outMoved > 80) {
+        rivoCheckDecryptOutput(out, *outMoved);
+    }
+    return st;
+}
+
+// CCCryptorGCM（AES-GCM 分步）
+static CCCryptorStatus (*orig_CCCryptorGCM)(CCOperation, CCAlgorithm, const void *, size_t,
+                                            const void *, const void *, size_t,
+                                            const void *, size_t, void *, size_t *);
+static CCCryptorStatus rivo_CCCryptorGCM(CCOperation op, CCAlgorithm alg, const void *key, size_t keyLength,
+                                         const void *iv, const void *aData, size_t aDataLen,
+                                         const void *in, size_t inLen, void *out, size_t *outMoved) {
+    CCCryptorStatus st = orig_CCCryptorGCM(op, alg, key, keyLength, iv, aData, aDataLen, in, inLen, out, outMoved);
+    if (st == kCCSuccess && op == kCCDecrypt && out && outMoved && *outMoved > 80) {
+        rivoCheckDecryptOutput(out, *outMoved);
+    }
+    return st;
+}
+
+static void rivoHookCCCryptor(void) {
+    rebind_symbols((struct rebinding[]){
+        {"CCCryptorCreateWithMode", (void *)rivo_CCCryptorCreateWithMode, (void **)&orig_CCCryptorCreateWithMode},
+        {"CCCryptorUpdate",         (void *)rivo_CCCryptorUpdate,         (void **)&orig_CCCryptorUpdate},
+        {"CCCryptorFinal",          (void *)rivo_CCCryptorFinal,          (void **)&orig_CCCryptorFinal},
+        {"CCCryptorGCM",            (void *)rivo_CCCryptorGCM,            (void **)&orig_CCCryptorGCM}
+    }, 4);
+    rivoAppendLog(@"CCCryptor* hooks installed");
+}
+
+#pragma mark - LibboxSetup C 函数 hook（sing-box 配置入口，dump 结构找明文）
+
+static int (*orig_LibboxSetup)(void *options);
+
+// 从可能的内存地址安全读取字符串（Go string = {char* ptr; int64 len;}，用 mach_vm_read 防崩溃）
+static void rivoTryReadGoString(const unsigned char *mem, long offset) {
+    unsigned long long ptr = 0;
+    unsigned long long len = 0;
+    memcpy(&ptr, mem + offset, 8);
+    memcpy(&len, mem + offset + 8, 8);
+    if (ptr < 0x10000 || len == 0 || len > 0x100000) return;
+    if (ptr > 0x7fffffffffffULL) return;
+    vm_offset_t data = 0;
+    mach_msg_type_number_t cnt = 0;
+    kern_return_t kr = mach_vm_read(mach_task_self(), (mach_vm_address_t)ptr, (mach_msg_type_number_t)len, &data, &cnt);
+    if (kr != KERN_SUCCESS || cnt == 0) return;
+    int printable = 1;
+    for (unsigned long long i = 0; i < cnt; i++) {
+        unsigned char c = ((unsigned char *)data)[i];
+        if (c < 0x09 || (c > 0x0D && c < 0x20)) { printable = 0; break; }
+    }
+    if (printable && cnt >= 4) {
+        NSString *s = [[NSString alloc] initWithBytes:(const void *)data length:cnt encoding:NSUTF8StringEncoding];
+        if (s.length) {
+            rivoAppendLog(@"LibboxSetup string[off=%ld len=%u]: %@", offset, cnt,
+                          s.length > 400 ? [s substringToIndex:400] : s);
+            if (rivoLooksLikeConfigString(s)) {
+                rivoHandleConfig(s, @"LibboxSetup options");
+            }
+        }
+    }
+    vm_deallocate(mach_task_self(), data, cnt);
+}
+
+static int rivo_LibboxSetup(void *options) {
+    rivoAppendLog(@">>> LibboxSetup called, options=%p", options);
+    if (options) {
+        const unsigned char *mem = (const unsigned char *)options;
+        // 扫描 struct 前 1024 字节中的 Go string 字段（每 16 字节一个候选）
+        for (long off = 0; off < 1024 - 16; off += 8) {
+            @try {
+                rivoTryReadGoString(mem, off);
+            } @catch (NSException *e) {}
+        }
+        // 前 256 字节 hex dump
+        NSMutableString *hex = [NSMutableString string];
+        for (int i = 0; i < 256 && i < 1024; i++) {
+            [hex appendFormat:@"%02X ", mem[i]];
+            if (i % 16 == 15) [hex appendString:@"\n"];
+        }
+        rivoAppendLog(@"LibboxSetup options hex:\n%@", hex);
+    }
+    if (orig_LibboxSetup) {
+        return orig_LibboxSetup(options);
+    }
+    return 0;
+}
+
+static void rivoHookLibboxSetup(void) {
+    rebind_symbols((struct rebinding[]){
+        {"LibboxSetup", (void *)rivo_LibboxSetup, (void **)&orig_LibboxSetup}
+    }, 1);
+    rivoAppendLog(@"LibboxSetup hook installed");
 }
 
 #pragma mark - 执行 hook
@@ -589,6 +732,8 @@ static void rivoTryHook(int attempt) {
 __attribute__((constructor)) static void rivoInit(void) {
     // CCCrypt + NSJSONSerialization hook 不需要等类加载，constructor 里立刻做
     rivoHookCCCrypt();
+    rivoHookCCCryptor();
+    rivoHookLibboxSetup();
     rivoHookNSJSON();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
