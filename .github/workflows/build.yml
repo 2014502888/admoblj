@@ -18,6 +18,10 @@ jobs:
           sudo chown "$USER" /opt/theos
           git clone --recursive https://github.com/theos/theos.git /opt/theos
 
+      - name: Install ldid
+        run: |
+          brew install ldid || brew install ldid-procursus
+
       - name: Build dylib
         env:
           THEOS: /opt/theos
