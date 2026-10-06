@@ -1,0 +1,8 @@
+Package: com.rivo.adblock
+Name: RivoVPNAD
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Block AdMob ads (AppOpen/Interstitial/Banner/Rewarded) in RivoVPN
+Maintainer: rivo
+Author: rivo
+Section: Tweaks
