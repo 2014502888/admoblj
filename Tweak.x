@@ -2,7 +2,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// ===== RivoVPNAD v3: 延迟轮询 hook（解决 AdMob 类懒加载导致 hook 失效）=====
+// ===== RivoVPNAD v5: 全广告SDK hook(AdMob+UnityAds+Vungle) + NSURLProtocol节点抓取 =====
 
 #pragma mark - 工具函数
 
@@ -16,7 +16,7 @@ static BOOL rivoIsGADObject(id obj) {
     if (!obj) return NO;
     NSString *cls = NSStringFromClass([obj class]);
     if (!cls) return NO;
-    return [cls hasPrefix:@"GAD"] || [cls hasPrefix:@"Google"];
+    return [cls hasPrefix:@"GAD"] || [cls hasPrefix:@"Google"] || [cls hasPrefix:@"Unity"];
 }
 
 static BOOL rivoIsTargetURL(NSString *url) {
@@ -77,7 +77,7 @@ static void rivoCollectNodes(id obj, NSMutableArray *uris, int depth) {
         }
     } else if ([obj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *d = (NSDictionary *)obj;
-        for (NSString *key in @[@"outbounds", @"nodes", @"servers", @"serverList", @"list", @"proxies", @"configs", @"data"]) {
+        for (NSString *key in @[@"outbounds", @"nodes", @"servers", @"serverList", @"list", @"proxies", @"configs", @"data", @"subs", @"groups"]) {
             id val = d[key];
             if ([val isKindOfClass:[NSArray class]]) {
                 for (id item in (NSArray *)val) {
@@ -145,7 +145,7 @@ static void rivoSaveNodes(NSData *data, NSString *url) {
     rivoShowAlert(@"RivoVPNAD", [NSString stringWithFormat:@"已抓取 %lu 个节点，订阅链接已复制到剪贴板\nShadowrocket 中粘贴即可导入", (unsigned long)uris.count]);
 }
 
-#pragma mark - 方案 A：广告加载直接失败（触发官方免费解锁）
+#pragma mark - 广告 hook（AdMob：加载直接失败）
 
 static void rivoFailFullScreenLoad(id self, SEL _cmd, id adUnitID, id request, id handler) {
     void (^completion)(id, NSError *) = handler;
@@ -155,9 +155,27 @@ static void rivoFailFullScreenLoad(id self, SEL _cmd, id adUnitID, id request, i
 static void rivoEmptyBannerLoad(id self, SEL _cmd, id request) {
 }
 
-#pragma mark - 展示层兜底拦截（Banner / 原生广告）
+#pragma mark - Unity Ads：load 直接失败（触发 App 免费解锁兜底）
 
-static IMP origAddSubviewIMP = NULL;   // 在 hook 时保存原实现，不能在调用时获取（会取到自己→递归闪退）
+static void rivoUnityLoadFail(id self, SEL _cmd, NSString *placementId, id delegate) {
+    // UnityAdsLoadError NO_FILL = 3，让 App 收到"广告无填充"→触发免费解锁
+    if (delegate && [delegate respondsToSelector:@selector(unityAdsLoadFailed:withError:withMessage:)]) {
+        [delegate unityAdsLoadFailed:placementId withError:3 withMessage:@"No fill (blocked by RivoVPNAD)"];
+    }
+}
+
+#pragma mark - Vungle：load 直接失败
+
+static BOOL rivoVungleLoadFail(id self, SEL _cmd, id placementID, NSError **err) {
+    if (err) {
+        *err = [NSError errorWithDomain:@"com.vungle" code:3 userInfo:@{NSLocalizedDescriptionKey: @"No fill (blocked)"}];
+    }
+    return NO;
+}
+
+#pragma mark - 展示层兜底拦截
+
+static IMP origAddSubviewIMP = NULL;
 
 static void rivoAddSubview(id self, SEL _cmd, id view) {
     if (rivoIsGADObject(view)) {
@@ -166,13 +184,55 @@ static void rivoAddSubview(id self, SEL _cmd, id view) {
     if (origAddSubviewIMP) {
         ((void (*)(id, SEL, id))origAddSubviewIMP)(self, _cmd, view);
     } else {
-        // 兜底：走 super 实现，避免空指针
         struct objc_super sup = { self, [UIView class] };
         ((void (*)(struct objc_super *, SEL, id))objc_msgSendSuper)(&sup, _cmd, view);
     }
 }
 
-#pragma mark - 节点抓取：hook NSURLSession
+#pragma mark - 节点抓取（主方案：NSURLProtocol 拦 URLSession 全部请求）
+
+@interface RivoURLProtocol : NSURLProtocol
+@end
+
+@implementation RivoURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    // 已由本协议转发的请求跳过，防止死循环
+    if ([NSURLProtocol propertyForKey:@"RivoAlreadyFetched" inRequest:request]) return NO;
+    return rivoIsTargetURL(request.URL.absoluteString);
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *newReq = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"RivoAlreadyFetched" inRequest:newReq];
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:newReq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (data.length) {
+            rivoSaveNodes(data, self.request.URL.absoluteString);
+        }
+        if (err) {
+            [self.client URLProtocol:self didFailWithError:err];
+        } else {
+            [self.client URLProtocol:self didReceiveResponse:resp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:data ?: [NSData data]];
+            [self.client URLProtocolDidFinishLoading:self];
+        }
+    }];
+    [task resume];
+}
+
+- (void)stopLoading {
+}
+
+@end
+
+#pragma mark - 备用：NSURLSession dataTask hook（部分场景不走 NSURLProtocol）
 
 static IMP origDataTaskIMP = NULL;
 
@@ -189,10 +249,10 @@ static id rivoDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
     return ((id (*)(id, SEL, id, id))origDataTaskIMP)(self, _cmd, req, completion);
 }
 
-#pragma mark - 执行 hook（AdMob 类懒加载 → 延迟轮询）
+#pragma mark - 执行 hook（延迟轮询等所有类加载）
 
 static void rivoDoHook(void) {
-    static BOOL hooked = NO;   // 防止重复执行把 orig IMP 覆盖成自己
+    static BOOL hooked = NO;
     if (hooked) return;
     hooked = YES;
 
@@ -220,14 +280,31 @@ static void rivoDoHook(void) {
         if (m) method_setImplementation(m, (IMP)rivoEmptyBannerLoad);
     }
 
-    // 2) 展示层兜底：GAD 视图挂载即隐藏（先保存原 IMP 再替换，避免递归）
+    // 2) Unity Ads：load 直接失败
+    Class unityAds = NSClassFromString(@"UnityAds");
+    if (unityAds) {
+        Method mu = class_getClassMethod(unityAds, @selector(load:loadDelegate:));
+        if (mu) method_setImplementation(mu, (IMP)rivoUnityLoadFail);
+    }
+
+    // 3) Vungle：load 直接失败
+    Class vungleAds = NSClassFromString(@"VungleAds");
+    if (vungleAds) {
+        Method mv = class_getClassMethod(vungleAds, NSSelectorFromString(@"loadPlacementWithPlacementID:error:"));
+        if (mv) method_setImplementation(mv, (IMP)rivoVungleLoadFail);
+    }
+
+    // 4) 展示层兜底：GAD/Unity 视图挂载即隐藏（先保存原 IMP 再替换）
     Method ma = class_getInstanceMethod([UIView class], @selector(addSubview:));
     if (ma) {
         origAddSubviewIMP = method_getImplementation(ma);
         method_setImplementation(ma, (IMP)rivoAddSubview);
     }
 
-    // 3) 节点抓取：NSURLSession 响应拦截
+    // 5) 节点抓取主方案：注册 NSURLProtocol
+    [NSURLProtocol registerClass:[RivoURLProtocol class]];
+
+    // 6) 备用：NSURLSession dataTask hook
     Method md = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
     if (md) {
         origDataTaskIMP = method_getImplementation(md);
@@ -237,8 +314,8 @@ static void rivoDoHook(void) {
 
 static void rivoTryHook(int attempt) {
     Class gRew = NSClassFromString(@"GADRewardedAd");
-    Class gBanner = NSClassFromString(@"GADBannerView");
-    if (gRew || gBanner || attempt >= 15) {
+    Class unityAds = NSClassFromString(@"UnityAds");
+    if (gRew || unityAds || attempt >= 15) {
         rivoDoHook();
         return;
     }
