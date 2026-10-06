@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 // ===== RivoVPNAD v3: 延迟轮询 hook（解决 AdMob 类懒加载导致 hook 失效）=====
 
