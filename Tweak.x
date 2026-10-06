@@ -415,6 +415,62 @@ static id rivoDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
     return ((id (*)(id, SEL, id, id))origDataTaskIMP)(self, _cmd, req, completion);
 }
 
+#pragma mark - NSJSONSerialization hook（明文节点 JSON 必经之路）
+
+static BOOL rivoLooksLikeConfigString(NSString *s) {
+    if (s.length < 120) return NO;
+    NSString *low = [s lowercaseString];
+    return [low containsString:@"\"server\""] ||
+           [low containsString:@"outbounds"] ||
+           ([low containsString:@"uuid"] && [low containsString:@"server_port"]) ||
+           ([low containsString:@"rivo"] && [low containsString:@"server"]);
+}
+
+static NSData *(*orig_NSJSON_dataWithJSONObject)(Class, SEL, id, NSJSONWritingOptions, NSError **);
+
+static NSData *rivo_NSJSON_dataWithJSONObject(Class cls, SEL _cmd, id obj, NSJSONWritingOptions opt, NSError **err) {
+    NSData *data = orig_NSJSON_dataWithJSONObject(cls, _cmd, obj, opt, err);
+    @try {
+        if (data.length > 120) {
+            NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (rivoLooksLikeConfigString(s)) {
+                rivoAppendLog(@"NSJSONSerialization serialize captured (%lu bytes)", (unsigned long)data.length);
+                rivoHandleConfig(s, @"NSJSONSerialization serialize");
+            }
+        }
+    } @catch (NSException *e) {}
+    return data;
+}
+
+static id (*orig_NSJSON_JSONObjectWithData)(Class, SEL, NSData *, NSJSONReadingOptions, NSError **);
+
+static id rivo_NSJSON_JSONObjectWithData(Class cls, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **err) {
+    @try {
+        if (data.length > 120) {
+            NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (rivoLooksLikeConfigString(s)) {
+                rivoAppendLog(@"NSJSONSerialization parse captured (%lu bytes)", (unsigned long)data.length);
+                rivoHandleConfig(s, @"NSJSONSerialization parse");
+            }
+        }
+    } @catch (NSException *e) {}
+    return orig_NSJSON_JSONObjectWithData(cls, _cmd, data, opt, err);
+}
+
+static void rivoHookNSJSON(void) {
+    Method m1 = class_getClassMethod([NSJSONSerialization class], @selector(dataWithJSONObject:options:error:));
+    if (m1) {
+        orig_NSJSON_dataWithJSONObject = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)rivo_NSJSON_dataWithJSONObject);
+    }
+    Method m2 = class_getClassMethod([NSJSONSerialization class], @selector(JSONObjectWithData:options:error:));
+    if (m2) {
+        orig_NSJSON_JSONObjectWithData = (void *)method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)rivo_NSJSON_JSONObjectWithData);
+    }
+    rivoAppendLog(@"NSJSONSerialization hooks installed");
+}
+
 #pragma mark - 执行 hook
 
 static void rivoDoHook(void) {
@@ -422,8 +478,7 @@ static void rivoDoHook(void) {
     if (hooked) return;
     hooked = YES;
 
-    // 0) CCCrypt 解密抓取（fishhook，尽早生效）
-    rivoHookCCCrypt();
+    // 0) CCCrypt + NSJSONSerialization 已在 constructor 中 hook（勿重复，会递归）
 
     // 1) AdMob 全屏广告：加载直接失败
     Class gAppOpen = NSClassFromString(@"GADAppOpenAd");
@@ -499,8 +554,9 @@ static void rivoTryHook(int attempt) {
 }
 
 __attribute__((constructor)) static void rivoInit(void) {
-    // CCCrypt hook 不需要等类加载，constructor 里立刻做
+    // CCCrypt + NSJSONSerialization hook 不需要等类加载，constructor 里立刻做
     rivoHookCCCrypt();
+    rivoHookNSJSON();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        rivoTryHook(0);
