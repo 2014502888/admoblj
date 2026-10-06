@@ -159,8 +159,10 @@ static void rivoEmptyBannerLoad(id self, SEL _cmd, id request) {
 
 static void rivoUnityLoadFail(id self, SEL _cmd, NSString *placementId, id delegate) {
     // UnityAdsLoadError NO_FILL = 3，让 App 收到"广告无填充"→触发免费解锁
-    if (delegate && [delegate respondsToSelector:@selector(unityAdsLoadFailed:withError:withMessage:)]) {
-        [delegate unityAdsLoadFailed:placementId withError:3 withMessage:@"No fill (blocked by RivoVPNAD)"];
+    // 用 objc_msgSend 直接发消息（避免编译器不认识 UnityAds 协议 selector）
+    SEL failSel = NSSelectorFromString(@"unityAdsLoadFailed:withError:withMessage:");
+    if (delegate && [delegate respondsToSelector:failSel]) {
+        ((void (*)(id, SEL, id, NSInteger, id))objc_msgSend)(delegate, failSel, placementId, 3, @"No fill (blocked by RivoVPNAD)");
     }
 }
 
