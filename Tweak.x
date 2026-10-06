@@ -28,8 +28,12 @@ static BOOL rivoIsTargetURL(NSString *url) {
            [url containsString:@"flag.rivovpn"];
 }
 
-static void rivoAppendLog(NSString *line) {
+static void rivoAppendLog(NSString *fmt, ...) {
     @try {
+        va_list args;
+        va_start(args, fmt);
+        NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+        va_end(args);
         NSString *home = NSHomeDirectory();
         NSString *logPath = [home stringByAppendingPathComponent:@"Documents/rivo_debug.log"];
         NSString *stamp = [NSDateFormatter localizedStringFromDate:[NSDate date]
@@ -71,7 +75,14 @@ static NSString *rivoURIFromSingbox(NSDictionary *d) {
     NSString *server = d[@"server"];
     NSNumber *portN = d[@"server_port"] ?: d[@"port"];
     if (!server || !portN) return nil;
-    NSString *port = [portN stringValue];
+    NSString *port;
+    if ([portN isKindOfClass:[NSNumber class]]) {
+        port = [portN stringValue];
+    } else if ([portN isKindOfClass:[NSString class]]) {
+        port = (NSString *)portN;
+    } else {
+        return nil;
+    }
     NSString *name = rivoTagName(d[@"tag"] ?: @"rivo");
     NSDictionary *tls = d[@"tls"];
     NSString *sni = tls[@"server_name"] ?: tls[@"serverName"];
