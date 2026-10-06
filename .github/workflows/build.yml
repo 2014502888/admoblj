@@ -27,7 +27,7 @@ jobs:
           THEOS: /opt/theos
           THEOS_PACKAGE_SCHEME: rootless
         run: |
-          make clean package
+          make clean
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -35,4 +35,3 @@ jobs:
           name: RivoVPNAD-dylib
           path: |
             .theos/obj/debug/arm64/RivoVPNAD.dylib
-            packages/*.deb

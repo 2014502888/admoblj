@@ -156,13 +156,19 @@ static void rivoEmptyBannerLoad(id self, SEL _cmd, id request) {
 
 #pragma mark - 展示层兜底拦截（Banner / 原生广告）
 
+static IMP origAddSubviewIMP = NULL;   // 在 hook 时保存原实现，不能在调用时获取（会取到自己→递归闪退）
+
 static void rivoAddSubview(id self, SEL _cmd, id view) {
-    static IMP origImp = NULL;
-    if (!origImp) origImp = method_getImplementation(class_getInstanceMethod([UIView class], @selector(addSubview:)));
     if (rivoIsGADObject(view)) {
         ((UIView *)view).hidden = YES;
     }
-    ((void (*)(id, SEL, id))origImp)(self, _cmd, view);
+    if (origAddSubviewIMP) {
+        ((void (*)(id, SEL, id))origAddSubviewIMP)(self, _cmd, view);
+    } else {
+        // 兜底：走 super 实现，避免空指针
+        struct objc_super sup = { self, [UIView class] };
+        ((void (*)(struct objc_super *, SEL, id))objc_msgSendSuper)(&sup, _cmd, view);
+    }
 }
 
 #pragma mark - 节点抓取：hook NSURLSession
@@ -185,6 +191,10 @@ static id rivoDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
 #pragma mark - 执行 hook（AdMob 类懒加载 → 延迟轮询）
 
 static void rivoDoHook(void) {
+    static BOOL hooked = NO;   // 防止重复执行把 orig IMP 覆盖成自己
+    if (hooked) return;
+    hooked = YES;
+
     // 1) AdMob 全屏广告：加载直接失败
     Class gAppOpen = NSClassFromString(@"GADAppOpenAd");
     Class gInter = NSClassFromString(@"GADInterstitialAd");
@@ -209,9 +219,12 @@ static void rivoDoHook(void) {
         if (m) method_setImplementation(m, (IMP)rivoEmptyBannerLoad);
     }
 
-    // 2) 展示层兜底：GAD 视图挂载即隐藏
+    // 2) 展示层兜底：GAD 视图挂载即隐藏（先保存原 IMP 再替换，避免递归）
     Method ma = class_getInstanceMethod([UIView class], @selector(addSubview:));
-    if (ma) method_setImplementation(ma, (IMP)rivoAddSubview);
+    if (ma) {
+        origAddSubviewIMP = method_getImplementation(ma);
+        method_setImplementation(ma, (IMP)rivoAddSubview);
+    }
 
     // 3) 节点抓取：NSURLSession 响应拦截
     Method md = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
