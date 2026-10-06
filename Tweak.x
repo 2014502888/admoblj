@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <CommonCrypto/CommonCryptor.h>
 #import <dlfcn.h>
+#import <string.h>
 #include "fishhook.h"
 
 // ===== RivoVPNAD v6.2: fishhook CCCrypt 解密抓取 + 广告hook保留 + 响应按URL分存 =====
@@ -179,6 +180,22 @@ static void rivoShowAlert(NSString *title, NSString *msg) {
 // 节点/重入全局标志（必须在 rivoHandleConfig 之前声明）
 static int rivoJSONReentry = 0;        // NSJSONSerialization hook 重入保护
 static BOOL rivoConfigHandled = NO;    // 同会话成功解析过节点则不再重复弹窗
+static size_t rivoLastLen = 0;         // 去重：上次处理的内容大小
+static unsigned char rivoLastHead[48]; // 去重：上次处理内容头部
+
+// 同一内容只处理一次（App 会循环解析同一个 config，避免 1700+ 次写文件拖慢）
+static BOOL rivoIsDuplicate(NSData *data) {
+    size_t n = data.length;
+    const unsigned char *b = (const unsigned char *)data.bytes;
+    size_t cmp = n < 48 ? n : 48;
+    if (n == rivoLastLen && memcmp(b, rivoLastHead, cmp) == 0) {
+        return YES;
+    }
+    rivoLastLen = n;
+    memset(rivoLastHead, 0, sizeof(rivoLastHead));
+    if (cmp > 0) memcpy(rivoLastHead, b, cmp);
+    return NO;
+}
 
 static void rivoHandleConfig(NSString *configJson, NSString *source) {
     if (!configJson.length) return;
@@ -442,7 +459,7 @@ static NSData *rivo_NSJSON_dataWithJSONObject(Class cls, SEL _cmd, id obj, NSJSO
         if (data.length > 120 && rivoJSONReentry == 0 && !rivoConfigHandled) {
             rivoJSONReentry++;
             NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (rivoLooksLikeConfigString(s)) {
+            if (rivoLooksLikeConfigString(s) && !rivoIsDuplicate(data)) {
                 rivoAppendLog(@"NSJSONSerialization serialize captured (%lu bytes)", (unsigned long)data.length);
                 rivoHandleConfig(s, @"NSJSONSerialization serialize");
             }
@@ -461,7 +478,7 @@ static id rivo_NSJSON_JSONObjectWithData(Class cls, SEL _cmd, NSData *data, NSJS
         if (data.length > 120 && rivoJSONReentry == 0 && !rivoConfigHandled) {
             rivoJSONReentry++;
             NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (rivoLooksLikeConfigString(s)) {
+            if (rivoLooksLikeConfigString(s) && !rivoIsDuplicate(data)) {
                 rivoAppendLog(@"NSJSONSerialization parse captured (%lu bytes)", (unsigned long)data.length);
                 rivoHandleConfig(s, @"NSJSONSerialization parse");
             }
