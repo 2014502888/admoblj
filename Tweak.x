@@ -7,7 +7,16 @@
 #import <mach/mach.h>
 #include "fishhook.h"
 
-// ===== RivoVPNAD v6.2: fishhook CCCrypt 解密抓取 + 广告hook保留 + 响应按URL分存 =====
+// ===== RivoVPNAD v7: 广告展示层拦截（激励广告跳过展示直接发奖励）+ 节点抓取 =====
+// v7 变更：
+//   - 定位到"点连接后全屏广告+进度条"= 激励广告（AdMob Rewarded / UnityAds show）在展示层弹出，
+//     旧版只拦 load（加载失败）但 App 仍能展示，addSubview 兜底也拦不到全屏 modal。
+//   - 激励广告（GADRewardedAd / UnityAds）：不拦 load（App 需加载成功才进发奖流程），
+//     改为 hook 展示层 present/show —— 跳过广告画面，直接回调"已看完"→ PRO 免费时长照拿。
+//   - 开屏/插屏/横幅（GADAppOpenAd / GADInterstitialAd / GADBannerView）：load 直接失败，零广告请求。
+//   - 万能兜底：hook UIViewController presentViewController，任何广告类 VC 弹全屏直接拦截。
+//   - 全部拦截点写 rivo_debug.log，方便回传确认真实展示源。
+//   - 节点抓取保留：CCCrypt/CCCryptor/LibboxSetup/NSJSON + NSURLProtocol/dataTask 按 URL 分存。
 // v6 发现 LibboxSetup 是 C 函数非 ObjC 类；config 接口(/api/v1/ios/config)返回的是
 // rivoLinks 密文(AES)。v6.2 改用 fishhook 重绑定 CommonCrypto 的 CCCrypt，
 // 拦截 kCCDecrypt 输出(即解密后的明文节点数据)，落盘验证 + 尝试解析成订阅。
@@ -316,15 +325,6 @@ static void rivoFailFullScreenLoad(id self, SEL _cmd, id adUnitID, id request, i
 static void rivoEmptyBannerLoad(id self, SEL _cmd, id request) {
 }
 
-#pragma mark - Unity Ads：load 直接失败（触发 App 免费解锁兜底）
-
-static void rivoUnityLoadFail(id self, SEL _cmd, NSString *placementId, id delegate) {
-    SEL failSel = NSSelectorFromString(@"unityAdsLoadFailed:withError:withMessage:");
-    if (delegate && [delegate respondsToSelector:failSel]) {
-        ((void (*)(id, SEL, id, NSInteger, id))objc_msgSend)(delegate, failSel, placementId, 3, @"No fill (blocked by RivoVPNAD)");
-    }
-}
-
 #pragma mark - Vungle：load 直接失败
 
 static BOOL rivoVungleLoadFail(id self, SEL _cmd, id placementID, NSError **err) {
@@ -347,6 +347,100 @@ static void rivoAddSubview(id self, SEL _cmd, id view) {
     } else {
         struct objc_super sup = { self, [UIView class] };
         ((void (*)(struct objc_super *, SEL, id))objc_msgSendSuper)(&sup, _cmd, view);
+    }
+}
+
+#pragma mark - v7 展示层拦截（激励广告跳过展示直接发奖励，其余不展示）
+
+// 构造一个最小可用的 GADAdReward（amount=1, type=reward）
+static id rivoMakeReward(void) {
+    @try {
+        Class cls = NSClassFromString(@"GADAdReward");
+        if (!cls) return nil;
+        id obj = [cls alloc];
+        SEL sel = NSSelectorFromString(@"initWithRewardType:amount:");
+        if ([obj respondsToSelector:sel]) {
+            return ((id (*)(id, SEL, id, id))objc_msgSend)(obj, sel, @"reward",
+                                                           [NSDecimalNumber decimalNumberWithString:@"1"]);
+        }
+        SEL plain = NSSelectorFromString(@"init");
+        if ([obj respondsToSelector:plain]) {
+            return ((id (*)(id, SEL))objc_msgSend)(obj, plain);
+        }
+        return obj;
+    } @catch (NSException *e) {
+        rivoAppendLog(@"AD-BLOCK: rivoMakeReward 异常 %@", e);
+        return nil;
+    }
+}
+
+// 通知全屏广告 delegate 已关闭（防止 App 卡在"等待广告关闭"状态）
+static void rivoNotifyDismissed(id ad) {
+    @try {
+        id delegate = [ad valueForKey:@"delegate"];
+        if (delegate && [delegate respondsToSelector:NSSelectorFromString(@"adDidDismissFullScreenContent:")]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(delegate, NSSelectorFromString(@"adDidDismissFullScreenContent:"), ad);
+        }
+    } @catch (NSException *e) {
+        rivoAppendLog(@"AD-BLOCK: rivoNotifyDismissed 异常 %@", e);
+    }
+}
+
+// GADRewardedAd present：不展示，直接给奖励 + 通知关闭（PRO 6 小时照拿）
+static void rivoRewardPresent(id self, SEL _cmd, id vc, id rewardHandler) {
+    rivoAppendLog(@"AD-BLOCK: GADRewardedAd present 拦截 -> 直接发奖励 (class=%@)", NSStringFromClass([self class]));
+    if (rewardHandler) {
+        ((void (^)(id))rewardHandler)(rivoMakeReward());
+    }
+    rivoNotifyDismissed(self);
+}
+
+// GADInterstitialAd / GADAppOpenAd present：不展示
+static void rivoFullScreenPresent(id self, SEL _cmd, id vc) {
+    rivoAppendLog(@"AD-BLOCK: %@ present 拦截 -> 不展示", NSStringFromClass([self class]));
+    rivoNotifyDismissed(self);
+}
+
+// UnityAds show：不展示，直接走"完成"回调（UnityAdsShowFinishState=0 COMPLETED）
+static void rivoUnityShow(id self, SEL _cmd, NSString *placementId, id showDelegate) {
+    rivoAppendLog(@"AD-BLOCK: UnityAds show 拦截 -> 直接完成 (placement=%@)", placementId);
+    @try {
+        SEL startSel = NSSelectorFromString(@"unityAdsShowStart:");
+        if (showDelegate && [showDelegate respondsToSelector:startSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(showDelegate, startSel, placementId);
+        }
+        SEL completeSel = NSSelectorFromString(@"unityAdsShowComplete:withFinishState:");
+        if (showDelegate && [showDelegate respondsToSelector:completeSel]) {
+            ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(showDelegate, completeSel, placementId, 0);
+        }
+    } @catch (NSException *e) {
+        rivoAppendLog(@"AD-BLOCK: rivoUnityShow 异常 %@", e);
+    }
+}
+
+// 万能兜底：任何广告 VC 通过 presentViewController 弹全屏时直接拦截
+static IMP origPresentIMP = NULL;
+
+static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) {
+    @try {
+        NSString *cls = vc ? NSStringFromClass([vc class]) : @"";
+        BOOL isAd = cls.length > 0 && (
+            [cls hasPrefix:@"GAD"] || [cls hasPrefix:@"UnityAds"] ||
+            [cls hasPrefix:@"Vungle"] || [cls hasPrefix:@"Liftoff"] ||
+            [cls containsString:@"Interstitial"] || [cls containsString:@"Rewarded"] ||
+            [cls containsString:@"AppOpen"]);
+        if (isAd) {
+            rivoAppendLog(@"AD-BLOCK: presentViewController 兜底拦截 %@", cls);
+            return; // 广告不弹
+        }
+    } @catch (NSException *e) {
+        rivoAppendLog(@"AD-BLOCK: rivoPresent 异常 %@", e);
+    }
+    if (origPresentIMP) {
+        ((void (*)(id, SEL, id, BOOL, id))origPresentIMP)(self, _cmd, vc, animated, completion);
+    } else {
+        struct objc_super sup = { self, [UIViewController class] };
+        ((void (*)(struct objc_super *, SEL, id, BOOL, id))objc_msgSendSuper)(&sup, _cmd, vc, animated, completion);
     }
 }
 
@@ -656,7 +750,9 @@ static void rivoDoHook(void) {
 
     // 0) CCCrypt + NSJSONSerialization 已在 constructor 中 hook（勿重复，会递归）
 
-    // 1) AdMob 全屏广告：加载直接失败
+    // 1) AdMob 广告：
+    //    - 开屏/插屏/横幅：load 直接失败（零广告请求，不后台刷量）
+    //    - 激励广告(GADRewardedAd)：不拦 load（App 需要它"加载成功"才能进入发奖流程），改拦展示层 present 直接发奖励
     Class gAppOpen = NSClassFromString(@"GADAppOpenAd");
     Class gInter = NSClassFromString(@"GADInterstitialAd");
     Class gRew = NSClassFromString(@"GADRewardedAd");
@@ -666,25 +762,30 @@ static void rivoDoHook(void) {
     if (gAppOpen) {
         Method m = class_getClassMethod(gAppOpen, loadSel);
         if (m) method_setImplementation(m, (IMP)rivoFailFullScreenLoad);
+        Method mp = class_getInstanceMethod(gAppOpen, NSSelectorFromString(@"presentFromRootViewController:"));
+        if (mp) method_setImplementation(mp, (IMP)rivoFullScreenPresent);
     }
     if (gInter) {
         Method m = class_getClassMethod(gInter, loadSel);
         if (m) method_setImplementation(m, (IMP)rivoFailFullScreenLoad);
+        Method mp = class_getInstanceMethod(gInter, NSSelectorFromString(@"presentFromRootViewController:"));
+        if (mp) method_setImplementation(mp, (IMP)rivoFullScreenPresent);
     }
     if (gRew) {
-        Method m = class_getClassMethod(gRew, loadSel);
-        if (m) method_setImplementation(m, (IMP)rivoFailFullScreenLoad);
+        // 激励不拦 load（保证 App 能拿到 ad 走发奖流程），只拦展示层
+        Method mp = class_getInstanceMethod(gRew, NSSelectorFromString(@"presentFromRootViewController:userDidEarnRewardHandler:"));
+        if (mp) method_setImplementation(mp, (IMP)rivoRewardPresent);
     }
     if (gBanner) {
         Method m = class_getInstanceMethod(gBanner, @selector(loadRequest:));
         if (m) method_setImplementation(m, (IMP)rivoEmptyBannerLoad);
     }
 
-    // 2) Unity Ads：load 直接失败
+    // 2) Unity Ads：不拦 load，拦 show（激励直接完成回调，PRO 时间照拿）
     Class unityAds = NSClassFromString(@"UnityAds");
     if (unityAds) {
-        Method mu = class_getClassMethod(unityAds, @selector(load:loadDelegate:));
-        if (mu) method_setImplementation(mu, (IMP)rivoUnityLoadFail);
+        Method mu = class_getClassMethod(unityAds, NSSelectorFromString(@"show:showDelegate:"));
+        if (mu) method_setImplementation(mu, (IMP)rivoUnityShow);
     }
 
     // 3) Vungle：load 直接失败
@@ -699,6 +800,13 @@ static void rivoDoHook(void) {
     if (ma) {
         origAddSubviewIMP = method_getImplementation(ma);
         method_setImplementation(ma, (IMP)rivoAddSubview);
+    }
+
+    // 4.5) 万能兜底：任何广告 VC 通过 presentViewController 弹全屏时直接拦截（含中介/遗漏 SDK）
+    Method mpv = class_getInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:));
+    if (mpv) {
+        origPresentIMP = method_getImplementation(mpv);
+        method_setImplementation(mpv, (IMP)rivoPresent);
     }
 
     // 5) 节点抓取：注册 NSURLProtocol
