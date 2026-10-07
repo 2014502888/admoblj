@@ -5,14 +5,23 @@
 #import <dlfcn.h>
 #import <string.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #include "fishhook.h"
 
-// v7.2: Theos 部分 SDK 环境下 <mach/mach_vm.h> 的 mach_vm_read 声明不可见，
-// 手动补原型（与头文件重复声明合法，编译/链接均无冲突）
-extern kern_return_t mach_vm_read(vm_map_t target_task, mach_vm_address_t address,
-                                  mach_vm_size_t size, vm_offset_t *data,
-                                  mach_msg_type_number_t *dataCnt);
+// v7.3: iPhoneOS 26.5 新 SDK 中 <mach/mach_vm.h> 整文件 #error "unsupported"，
+// 删除该 import，mach_vm_read 改为 dlsym 动态查找（符号存在才调用，编译零依赖，
+// 运行时找不到符号则优雅跳过字符串扫描，不影响广告拦截）。
+typedef kern_return_t (*rivo_mach_vm_read_t)(vm_map_t, mach_vm_address_t, mach_vm_size_t,
+                                             vm_offset_t *, mach_msg_type_number_t *);
+static kern_return_t rivoMachVmRead(vm_map_t task, mach_vm_address_t addr, mach_vm_size_t size,
+                                    vm_offset_t *data, mach_msg_type_number_t *cnt) {
+    static rivo_mach_vm_read_t fn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (rivo_mach_vm_read_t)dlsym(RTLD_DEFAULT, "mach_vm_read");
+    });
+    if (!fn) return KERN_FAILURE;
+    return fn(task, addr, size, data, cnt);
+}
 
 // ===== RivoVPNAD v7: 广告展示层拦截（激励广告跳过展示直接发奖励）+ 节点抓取 =====
 // v7 变更：
@@ -697,7 +706,7 @@ static void rivoTryReadGoString(const unsigned char *mem, long offset) {
     if (ptr > 0x7fffffffffffULL) return;
     vm_offset_t data = 0;
     mach_msg_type_number_t cnt = 0;
-    kern_return_t kr = mach_vm_read(mach_task_self(), (mach_vm_address_t)ptr, (mach_msg_type_number_t)len, &data, &cnt);
+    kern_return_t kr = rivoMachVmRead(mach_task_self(), (mach_vm_address_t)ptr, (mach_msg_type_number_t)len, &data, &cnt);
     if (kr != KERN_SUCCESS || cnt == 0) return;
     int printable = 1;
     for (unsigned long long i = 0; i < cnt; i++) {
