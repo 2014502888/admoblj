@@ -5,6 +5,7 @@
 #import <dlfcn.h>
 #import <string.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
 #include "fishhook.h"
 
 // ===== RivoVPNAD v7: 广告展示层拦截（激励广告跳过展示直接发奖励）+ 节点抓取 =====
