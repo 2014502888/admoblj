@@ -486,6 +486,34 @@ static void rivoUnityShow(id self, SEL _cmd, NSString *placementId, id showDeleg
 // 万能兜底：任何广告 VC 通过 presentViewController 弹全屏时直接拦截
 static IMP origPresentIMP = NULL;
 
+// v7.5: 从广告 VC 回溯广告对象并触发奖励（PRO 走 GADFullScreenAdViewController 内部 VC 时用）
+static void rivoTryRewardFromAd(id ad) {
+    @try {
+        if (!ad) return;
+        // 优先找 reward handler block（新版 SDK 内部属性名）
+        NSArray *handlerKeys = @[@"didEarnRewardHandler", @"rewardHandler", @"earnedRewardHandler",
+                                 @"userDidEarnRewardHandler", @"rewardBasedVideoAdRewardHandler"];
+        for (NSString *k in handlerKeys) {
+            id h = nil;
+            @try { h = [ad valueForKey:k]; } @catch (NSException *e) {}
+            if (h) {
+                @try {
+                    ((void (^)(id))h)(rivoMakeReward());
+                    rivoAppendLog(@"AD-BLOCK: 从广告对象触发奖励 handler (key=%@, ad=%@)", k, NSStringFromClass([ad class]));
+                    return;
+                } @catch (NSException *e) {
+                    rivoAppendLog(@"AD-BLOCK: reward handler 调用异常 %@", e);
+                }
+            }
+        }
+        // 找不到 handler → 模拟完整生命周期（App 若在 delegate 回调里发奖也能走通）
+        rivoAppendLog(@"AD-BLOCK: 未找到 reward handler，模拟生命周期 (ad=%@)", NSStringFromClass([ad class]));
+        rivoSimulateLifecycle(ad, YES);
+    } @catch (NSException *e) {
+        rivoAppendLog(@"AD-BLOCK: rivoTryRewardFromAd 异常 %@", e);
+    }
+}
+
 static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) {
     @try {
         NSString *cls = vc ? NSStringFromClass([vc class]) : @"";
@@ -496,6 +524,25 @@ static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) 
             [cls containsString:@"AppOpen"]);
         if (isAd) {
             rivoAppendLog(@"AD-BLOCK: presentViewController 兜底拦截 %@", cls);
+            // v7.5: 若 vc 是 GAD 全屏广告内部 VC，回溯广告对象发奖励/模拟生命周期（解决 PRO 转圈）
+            if ([cls hasPrefix:@"GAD"]) {
+                id ad = nil;
+                @try { ad = [vc valueForKey:@"fullScreenAd"]; } @catch (NSException *e) {}
+                if (!ad) {
+                    @try { ad = [vc valueForKey:@"ad"]; } @catch (NSException *e) {}
+                }
+                if (ad) {
+                    rivoTryRewardFromAd(ad);
+                } else {
+                    // 拿不到广告对象：对 VC 内部弱引用广告再试一次
+                    @try {
+                        for (NSString *k in @[@"fullScreenAd", @"rewardedAd", @"interstitialAd", @"ad"]) {
+                            id a2 = [vc valueForKey:k];
+                            if (a2) { rivoTryRewardFromAd(a2); break; }
+                        }
+                    } @catch (NSException *e) {}
+                }
+            }
             return; // 广告不弹
         }
     } @catch (NSException *e) {
