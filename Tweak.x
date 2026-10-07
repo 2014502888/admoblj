@@ -656,7 +656,7 @@ static UIViewController *rivoTopPresentedVC(void) {
     for (UIWindow *ww in [UIApplication sharedApplication].windows) {
         if (ww.rootViewController) { w = ww; break; }
     }
-    if (!w) w = [UIApplication sharedApplication].keyWindow;
+    if (!w) return nil;
     UIViewController *top = w.rootViewController;
     while (top.presentedViewController) top = top.presentedViewController;
     return top;
