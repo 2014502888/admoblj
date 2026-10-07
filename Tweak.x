@@ -574,31 +574,6 @@ static id rivoFindRewardedAdInObject(id obj) {
     return rivoFindRewardedAdInObjectDepth(obj, 0);
 }
 
-// v7.6.1: 遍历广告对象 ivar 找 reward handler block（只认名字明确含 reward 的，绝不盲目调第一个 block）
-static id rivoFindRewardHandlerInAd(id ad) {
-    if (!ad) return nil;
-    unsigned int count = 0;
-    Ivar *ivars = class_copyIvarList([ad class], &count);
-    id handler = nil;
-    for (unsigned int i = 0; i < count; i++) {
-        Ivar iv = ivars[i];
-        @try {
-            NSString *type = [NSString stringWithUTF8String:ivar_getTypeEncoding(iv)];
-            NSString *name = [NSString stringWithUTF8String:ivar_getName(iv)];
-            if ([type hasPrefix:@"@?"]) { // block
-                id val = object_getIvar(ad, iv);
-                if (!val) continue;
-                if ([name rangeOfString:@"reward" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                    handler = val;
-                    break;
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    free(ivars);
-    return handler; // v7.6.1: 只认名字含 reward 的 block，绝不盲目调用任意 block
-}
-
 // v7.6.1: block 类型校验（block 对象的 isa 链含 NSBlock，非 block 调用会崩）
 static BOOL rivoIsBlock(id obj) {
     if (!obj) return NO;
@@ -612,42 +587,33 @@ static BOOL rivoIsBlock(id obj) {
     return NO;
 }
 
-// v7.5: 从广告 VC 回溯广告对象并触发奖励（PRO 走 GADFullScreenAdViewController 内部 VC 时用）
-static void rivoTryRewardFromAd(id ad) {
+// v7.9: 从广告对象安全触发奖励（只 KVC 精确属性名 + 生命周期兜底）
+// v7.6 崩溃根源是 ivar 遍历拿到签名未知的 block 强行调用；v7.9 只认 GAD SDK 公开
+// 属性（userDidEarnRewardHandler 等），签名固定 void(^)(GADAdReward*)，rivoIsBlock
+// 校验 + @try 包裹；拿不到 block 就模拟完整生命周期（App 在 delegate 回调里发奖也能走通）。
+static void rivoTriggerRewardSafe(id ad) {
     @try {
         if (!ad) return;
-        // 1) KVC 枚举找 reward handler block（新版 SDK 内部属性名）
-        NSArray *handlerKeys = @[@"didEarnRewardHandler", @"rewardHandler", @"earnedRewardHandler",
-                                 @"userDidEarnRewardHandler", @"rewardBasedVideoAdRewardHandler"];
+        NSArray *handlerKeys = @[@"userDidEarnRewardHandler", @"didEarnRewardHandler",
+                                 @"rewardHandler", @"earnedRewardHandler"];
         for (NSString *k in handlerKeys) {
             id h = nil;
             @try { h = [ad valueForKey:k]; } @catch (NSException *e) {}
-            if (h && rivoIsBlock(h)) { // v7.6.1: 必须真 block 才调（非 block 调用会崩）
+            if (h && rivoIsBlock(h)) {
                 @try {
                     ((void (^)(id))h)(rivoMakeReward());
-                    rivoAppendLog(@"AD-BLOCK: 从广告对象触发奖励 handler (key=%@, ad=%@)", k, NSStringFromClass([ad class]));
+                    rivoAppendLog(@"AD-BLOCK: ★已触发奖励 handler (key=%@, ad=%@)", k, NSStringFromClass([ad class]));
                     return;
                 } @catch (NSException *e) {
                     rivoAppendLog(@"AD-BLOCK: reward handler 调用异常 %@", e);
                 }
             }
         }
-        // 2) v7.6: ivar 遍历找 handler block（KVC 属性名对不上时）
-        id bh = rivoFindRewardHandlerInAd(ad);
-        if (bh && rivoIsBlock(bh)) {
-            @try {
-                ((void (^)(id))bh)(rivoMakeReward());
-                rivoAppendLog(@"AD-BLOCK: 从广告对象 ivar 触发奖励 handler (ad=%@)", NSStringFromClass([ad class]));
-                return;
-            } @catch (NSException *e) {
-                rivoAppendLog(@"AD-BLOCK: ivar handler 调用异常 %@", e);
-            }
-        }
-        // 3) 找不到 handler → 模拟完整生命周期（App 若在 delegate 回调里发奖也能走通）
+        // 拿不到 block → 模拟完整生命周期（willPresent → impression → 0.6s dismiss 回调）
         rivoAppendLog(@"AD-BLOCK: 未找到 reward handler，模拟生命周期 (ad=%@)", NSStringFromClass([ad class]));
         rivoSimulateLifecycle(ad, YES);
     } @catch (NSException *e) {
-        rivoAppendLog(@"AD-BLOCK: rivoTryRewardFromAd 异常 %@", e);
+        rivoAppendLog(@"AD-BLOCK: rivoTriggerRewardSafe 异常 %@", e);
     }
 }
 
@@ -676,28 +642,31 @@ static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) 
             return; // 广告不弹
         }
         if (isGAD) {
-            rivoAppendLog(@"AD-BLOCK: GAD 广告放行（%s）0.4s 后自动关闭", cls.UTF8String);
-            // v7.8: 不再依赖 viewDidAppear（GADFullScreenAdViewController 未自己实现该方法，
-            // class_getInstanceMethod 拿不到，hook 注册失败）→ 直接在放行后从 keyWindow
-            // 找顶层 presentedViewController（类名含 GAD）并 dismiss，让 App 自身 dismiss 回调自然发奖。
+            rivoAppendLog(@"AD-BLOCK: GAD 广告放行（%s）0.4s 后发奖并自动关闭", cls.UTF8String);
+            // v7.9: 0.4s 后——①从顶层 GAD VC 回溯广告对象触发奖励（KVC rewardHandler /
+            // 模拟生命周期回调，App 收到奖励才能续时长，不再卡转圈）；②dismiss 广告（一闪而过）。
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 @try {
                     UIViewController *top = rivoTopPresentedVC();
                     NSString *topCls = top ? NSStringFromClass([top class]) : @"";
                     rivoAppendLog(@"AD-BLOCK: 0.4s 后顶层 VC = %@", topCls);
-                    if (top && [topCls hasPrefix:@"GAD"]) {
+                    if (top && ([topCls hasPrefix:@"GAD"] ||
+                                [topCls containsString:@"FullScreen"] || [topCls containsString:@"Ad"])) {
+                        // 回溯广告对象（深度限制防环），先触发奖励
+                        id ad = rivoFindRewardedAdInObject(top);
+                        if (ad) {
+                            rivoTriggerRewardSafe(ad);
+                        } else {
+                            rivoAppendLog(@"AD-BLOCK: 未回溯到广告对象 (top=%@)", topCls);
+                        }
                         [top dismissViewControllerAnimated:NO completion:^{
-                            rivoAppendLog(@"AD-BLOCK: GAD 广告已 dismiss，等待 App 发奖");
+                            rivoAppendLog(@"AD-BLOCK: GAD 广告已 dismiss，奖励已触发");
                         }];
                     } else if (top) {
-                        // 类名不含 GAD 但确实是广告容器（SwiftUI 包装等），兜底也关
-                        if ([topCls containsString:@"FullScreen"] || [topCls containsString:@"Ad"]) {
-                            [top dismissViewControllerAnimated:NO completion:nil];
-                            rivoAppendLog(@"AD-BLOCK: 兜底 dismiss %@", topCls);
-                        }
+                        rivoAppendLog(@"AD-BLOCK: 顶层非广告 VC（%@），不处理", topCls);
                     }
                 } @catch (NSException *e) {
-                    rivoAppendLog(@"AD-BLOCK: 自动关闭异常 %@", e);
+                    rivoAppendLog(@"AD-BLOCK: 自动发奖/关闭异常 %@", e);
                 }
             });
         }
