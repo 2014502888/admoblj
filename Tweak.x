@@ -537,6 +537,8 @@ static id rivoFindRewardedAdInObjectDepth(id obj, int depth) {
         for (unsigned int i = 0; i < count && !found; i++) {
             Ivar iv = ivars[i];
             @try {
+                const char *t = ivar_getTypeEncoding(iv);
+                if (!t || t[0] != '@') continue; // v7.10: 只读对象类型 ivar，C 类型跳过防崩
                 id val = object_getIvar(obj, iv);
                 if (!val) continue;
                 NSString *vcls = NSStringFromClass([val class]);
@@ -552,6 +554,8 @@ static id rivoFindRewardedAdInObjectDepth(id obj, int depth) {
             for (unsigned int i = 0; i < count; i++) {
                 Ivar iv = ivars[i];
                 @try {
+                    const char *t = ivar_getTypeEncoding(iv);
+                    if (!t || t[0] != '@') continue; // v7.10: 同上
                     id val = object_getIvar(obj, iv);
                     if (val) {
                         id inner = rivoFindRewardedAdInObjectDepth(val, depth + 1);
@@ -587,10 +591,48 @@ static BOOL rivoIsBlock(id obj) {
     return NO;
 }
 
-// v7.9: 从广告对象安全触发奖励（只 KVC 精确属性名 + 生命周期兜底）
-// v7.6 崩溃根源是 ivar 遍历拿到签名未知的 block 强行调用；v7.9 只认 GAD SDK 公开
-// 属性（userDidEarnRewardHandler 等），签名固定 void(^)(GADAdReward*)，rivoIsBlock
-// 校验 + @try 包裹；拿不到 block 就模拟完整生命周期（App 在 delegate 回调里发奖也能走通）。
+// v7.10: block 签名验证——手动调未知签名 block 是 v7.6/v7.9 闪退根源（EXC_BAD_ACCESS，
+// @try 抓不住）。v7.10 读 block 描述符签名，仅当形如 v@?@（block 自身 + 单个 id 参数）
+// 才调用；否则跳过，走 delegate 生命周期回调（签名已知，安全）。
+#define RIVO_BLOCK_HAS_COPY_DISPOSE (1 << 25)
+#define RIVO_BLOCK_HAS_SIGNATURE    (1 << 30)
+
+struct rivoBlockLiteral {
+    void *isa;
+    int flags;
+    int reserved;
+    void *invoke;
+    void *descriptor;
+};
+
+static NSString *rivoBlockSignature(id block) {
+    if (!block) return nil;
+    struct rivoBlockLiteral *lit = (__bridge struct rivoBlockLiteral *)block;
+    if (!lit) return nil;
+    int flags = lit->flags;
+    if (!(flags & RIVO_BLOCK_HAS_SIGNATURE)) return nil;
+    void *p = (char *)lit->descriptor + 16; // 跳过 descriptor_1(reserved+size)
+    if (flags & RIVO_BLOCK_HAS_COPY_DISPOSE) p = (char *)p + 16; // 跳过 copy/dispose
+    const char *sig = *(const char **)p;
+    if (!sig) return nil;
+    return [NSString stringWithUTF8String:sig];
+}
+
+static BOOL rivoBlockIsRewardHandler(NSString *sig) {
+    if (!sig.length) return NO;
+    // 去掉偏移数字，压缩为紧凑编码（v@?@ / v@?@@ / v@?）
+    NSMutableString *m = [NSMutableString string];
+    for (NSUInteger i = 0; i < sig.length; i++) {
+        unichar c = [sig characterAtIndex:i];
+        if (c >= '0' && c <= '9') continue;
+        [m appendFormat:@"%C", c];
+    }
+    NSArray *parts = [m componentsSeparatedByString:@"@?"];
+    if (parts.count != 2) return NO;
+    return [parts[1] isEqualToString:@"@"];
+}
+
+// v7.9: 从广告对象安全触发奖励（KVC 精确属性名 + 签名验证 + 生命周期兜底）
 static void rivoTriggerRewardSafe(id ad) {
     @try {
         if (!ad) return;
@@ -600,17 +642,22 @@ static void rivoTriggerRewardSafe(id ad) {
             id h = nil;
             @try { h = [ad valueForKey:k]; } @catch (NSException *e) {}
             if (h && rivoIsBlock(h)) {
-                @try {
-                    ((void (^)(id))h)(rivoMakeReward());
-                    rivoAppendLog(@"AD-BLOCK: ★已触发奖励 handler (key=%@, ad=%@)", k, NSStringFromClass([ad class]));
-                    return;
-                } @catch (NSException *e) {
-                    rivoAppendLog(@"AD-BLOCK: reward handler 调用异常 %@", e);
+                NSString *sig = rivoBlockSignature(h);
+                if (sig.length && rivoBlockIsRewardHandler(sig)) {
+                    @try {
+                        ((void (^)(id))h)(rivoMakeReward());
+                        rivoAppendLog(@"AD-BLOCK: ★已触发奖励 handler (key=%@ sig=%@ ad=%@)", k, sig, NSStringFromClass([ad class]));
+                        return;
+                    } @catch (NSException *e) {
+                        rivoAppendLog(@"AD-BLOCK: reward handler 调用异常 %@", e);
+                    }
+                } else {
+                    rivoAppendLog(@"AD-BLOCK: reward block 签名不符跳过 (key=%@ sig=%@)", k, sig ?: @"(nil)");
                 }
             }
         }
-        // 拿不到 block → 模拟完整生命周期（willPresent → impression → 0.6s dismiss 回调）
-        rivoAppendLog(@"AD-BLOCK: 未找到 reward handler，模拟生命周期 (ad=%@)", NSStringFromClass([ad class]));
+        // 拿不到/不能安全调用 block → 模拟完整生命周期（willPresent → impression → 0.6s dismiss 回调）
+        rivoAppendLog(@"AD-BLOCK: 未安全触发 reward handler，模拟生命周期 (ad=%@)", NSStringFromClass([ad class]));
         rivoSimulateLifecycle(ad, YES);
     } @catch (NSException *e) {
         rivoAppendLog(@"AD-BLOCK: rivoTriggerRewardSafe 异常 %@", e);
