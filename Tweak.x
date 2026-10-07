@@ -390,31 +390,80 @@ static id rivoMakeReward(void) {
     }
 }
 
-// 通知全屏广告 delegate 已关闭（防止 App 卡在"等待广告关闭"状态）
-static void rivoNotifyDismissed(id ad) {
+// v7.4: 模拟完整广告生命周期（解决 PRO 转圈）
+// 真实 GADRewardedAd 展示时序：present → adWillPresentFullScreenContent → (播放)
+// → rewardHandler(reward) → adDidDismissFullScreenContent。
+// App 可能在 dismissed 后才发奖/续时长；旧代码只 KVC delegate 且不通知 willPresent/dismiss，
+// 新版 SDK delegate 属性是 fullScreenContentDelegate，KVC 拿不到 → 永远等 → PRO 转圈。
+// 现在：多属性名取 delegate + 完整回调序列（willPresent/impression 立即、dismiss 延迟 0.6s）。
+
+// 取全屏广告 delegate（兼容新旧属性名）
+static id rivoAdDelegate(id ad) {
     @try {
-        id delegate = [ad valueForKey:@"delegate"];
-        if (delegate && [delegate respondsToSelector:NSSelectorFromString(@"adDidDismissFullScreenContent:")]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(delegate, NSSelectorFromString(@"adDidDismissFullScreenContent:"), ad);
+        for (NSString *key in @[@"fullScreenContentDelegate", @"delegate", @"adDelegate", @"interstitialDelegate", @"rewardedAdDelegate"]) {
+            id v = [ad valueForKey:key];
+            if (v) return v;
         }
     } @catch (NSException *e) {
-        rivoAppendLog(@"AD-BLOCK: rivoNotifyDismissed 异常 %@", e);
+        rivoAppendLog(@"AD-BLOCK: rivoAdDelegate 异常 %@", e);
+    }
+    return nil;
+}
+
+// 通知 delegate 广告生命周期（模拟完整展示）
+static void rivoSimulateLifecycle(id ad, BOOL withReward) {
+    id delegate = rivoAdDelegate(ad);
+    if (!delegate) {
+        rivoAppendLog(@"AD-BLOCK: 未找到广告 delegate，模拟回调失败 (class=%@)", NSStringFromClass([ad class]));
+        return;
+    }
+    @try {
+        SEL willSel = NSSelectorFromString(@"adWillPresentFullScreenContent:");
+        if ([delegate respondsToSelector:willSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(delegate, willSel, ad);
+        }
+        SEL impSel = NSSelectorFromString(@"adDidRecordImpression:");
+        if ([delegate respondsToSelector:impSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(delegate, impSel, ad);
+        }
+        SEL dismissSel = NSSelectorFromString(@"adDidDismissFullScreenContent:");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if ([delegate respondsToSelector:dismissSel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(delegate, dismissSel, ad);
+                }
+                // 兼容非标准名 dismiss 回调
+                SEL d2 = NSSelectorFromString(@"adDidDismiss:");
+                if ([delegate respondsToSelector:d2]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(delegate, d2, ad);
+                }
+            } @catch (NSException *e) {
+                rivoAppendLog(@"AD-BLOCK: dismiss 回调异常 %@", e);
+            }
+        });
+    } @catch (NSException *e) {
+        rivoAppendLog(@"AD-BLOCK: lifecycle 异常 %@", e);
     }
 }
 
-// GADRewardedAd present：不展示，直接给奖励 + 通知关闭（PRO 6 小时照拿）
+// GADRewardedAd / GADRewardedInterstitialAd present：不展示，立即发奖励 + 模拟完整生命周期
 static void rivoRewardPresent(id self, SEL _cmd, id vc, id rewardHandler) {
-    rivoAppendLog(@"AD-BLOCK: GADRewardedAd present 拦截 -> 直接发奖励 (class=%@)", NSStringFromClass([self class]));
+    rivoAppendLog(@"AD-BLOCK: %@ present 拦截 -> 直接发奖励 (class=%@)", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
     if (rewardHandler) {
-        ((void (^)(id))rewardHandler)(rivoMakeReward());
+        @try {
+            ((void (^)(id))rewardHandler)(rivoMakeReward());
+        } @catch (NSException *e) {
+            rivoAppendLog(@"AD-BLOCK: rewardHandler 异常 %@", e);
+        }
     }
-    rivoNotifyDismissed(self);
+    rivoSimulateLifecycle(self, YES);
 }
 
-// GADInterstitialAd / GADAppOpenAd present：不展示
+// GADInterstitialAd / GADAppOpenAd present：不展示（load 已失败，一般不会到这一步）
 static void rivoFullScreenPresent(id self, SEL _cmd, id vc) {
     rivoAppendLog(@"AD-BLOCK: %@ present 拦截 -> 不展示", NSStringFromClass([self class]));
-    rivoNotifyDismissed(self);
+    rivoSimulateLifecycle(self, NO);
 }
 
 // UnityAds show：不展示，直接走"完成"回调（UnityAdsShowFinishState=0 COMPLETED）
@@ -790,6 +839,12 @@ static void rivoDoHook(void) {
     if (gRew) {
         // 激励不拦 load（保证 App 能拿到 ad 走发奖流程），只拦展示层
         Method mp = class_getInstanceMethod(gRew, NSSelectorFromString(@"presentFromRootViewController:userDidEarnRewardHandler:"));
+        if (mp) method_setImplementation(mp, (IMP)rivoRewardPresent);
+    }
+    // v7.4: GADRewardedInterstitialAd（激励插屏，PRO 页常用）同样不拦 load、拦 present 直接发奖励
+    Class gRewInter = NSClassFromString(@"GADRewardedInterstitialAd");
+    if (gRewInter) {
+        Method mp = class_getInstanceMethod(gRewInter, NSSelectorFromString(@"presentFromRootViewController:userDidEarnRewardHandler:"));
         if (mp) method_setImplementation(mp, (IMP)rivoRewardPresent);
     }
     if (gBanner) {
