@@ -486,11 +486,100 @@ static void rivoUnityShow(id self, SEL _cmd, NSString *placementId, id showDeleg
 // 万能兜底：任何广告 VC 通过 presentViewController 弹全屏时直接拦截
 static IMP origPresentIMP = NULL;
 
+// v7.6: 前置声明（rivoGADVCWillAppear 引用后面的函数）
+static id rivoFindRewardedAdInObject(id obj);
+static void rivoTryRewardFromAd(id ad);
+
+// v7.6: GADFullScreenAdViewController 兜底防护（present 拦截漏网时，viewWillAppear 隐藏+发奖）
+static IMP origGADVCWillAppearIMP = NULL;
+
+static void rivoGADVCWillAppear(id self, SEL _cmd, BOOL animated) {
+    @try {
+        rivoAppendLog(@"AD-BLOCK: GADFullScreenAdViewController viewWillAppear 拦截");
+        if ([self respondsToSelector:@selector(view)]) {
+            UIView *v = [self valueForKey:@"view"];
+            v.hidden = YES;
+            v.userInteractionEnabled = NO;
+        }
+        id ad = rivoFindRewardedAdInObject(self);
+        if (ad) rivoTryRewardFromAd(ad);
+    } @catch (NSException *e) {}
+    if (origGADVCWillAppearIMP) {
+        ((void (*)(id, SEL, BOOL))origGADVCWillAppearIMP)(self, _cmd, animated);
+    }
+}
+
+// v7.6: 遍历对象 ivar 找 GADRewarded* 广告对象（KVC 属性名不可靠，ivar 一定在）
+static id rivoFindRewardedAdInObject(id obj) {
+    if (!obj) return nil;
+    Class cls = [obj class];
+    NSString *clsName = NSStringFromClass(cls);
+    if ([clsName containsString:@"Rewarded"]) return obj; // 对象本身就是激励广告
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList(cls, &count);
+    id found = nil;
+    for (unsigned int i = 0; i < count && !found; i++) {
+        Ivar iv = ivars[i];
+        @try {
+            id val = object_getIvar(obj, iv);
+            if (!val) continue;
+            NSString *vcls = NSStringFromClass([val class]);
+            // 值类名含 Rewarded 的 ivar 就是激励广告对象（可能嵌一层：全屏 VC -> 广告）
+            if ([vcls containsString:@"Rewarded"] || [vcls containsString:@"GADFullScreenAd"]) {
+                found = val;
+                break;
+            }
+        } @catch (NSException *e) {}
+    }
+    free(ivars);
+    // 递归一层：某些对象是包装器，广告在它的 ivar 里
+    if (!found && count > 0) {
+        for (unsigned int i = 0; i < count; i++) {
+            Ivar iv = ivars[i];
+            @try {
+                id val = object_getIvar(obj, iv);
+                if (val) {
+                    id inner = rivoFindRewardedAdInObject(val);
+                    if (inner) { found = inner; break; }
+                }
+            } @catch (NSException *e) {}
+        }
+    }
+    return found;
+}
+
+// v7.6: 遍历广告对象 ivar 找 reward handler block（类型 @"@?"，名字含 reward 优先）
+static id rivoFindRewardHandlerInAd(id ad) {
+    if (!ad) return nil;
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList([ad class], &count);
+    id handler = nil;
+    id firstBlock = nil;
+    for (unsigned int i = 0; i < count; i++) {
+        Ivar iv = ivars[i];
+        @try {
+            NSString *type = [NSString stringWithUTF8String:ivar_getTypeEncoding(iv)];
+            NSString *name = [NSString stringWithUTF8String:ivar_getName(iv)];
+            if ([type hasPrefix:@"@?"]) { // block
+                id val = object_getIvar(ad, iv);
+                if (!val) continue;
+                if (!firstBlock) firstBlock = val;
+                if ([name rangeOfString:@"reward" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    handler = val;
+                    break;
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    free(ivars);
+    return handler ?: firstBlock;
+}
+
 // v7.5: 从广告 VC 回溯广告对象并触发奖励（PRO 走 GADFullScreenAdViewController 内部 VC 时用）
 static void rivoTryRewardFromAd(id ad) {
     @try {
         if (!ad) return;
-        // 优先找 reward handler block（新版 SDK 内部属性名）
+        // 1) KVC 枚举找 reward handler block（新版 SDK 内部属性名）
         NSArray *handlerKeys = @[@"didEarnRewardHandler", @"rewardHandler", @"earnedRewardHandler",
                                  @"userDidEarnRewardHandler", @"rewardBasedVideoAdRewardHandler"];
         for (NSString *k in handlerKeys) {
@@ -506,7 +595,18 @@ static void rivoTryRewardFromAd(id ad) {
                 }
             }
         }
-        // 找不到 handler → 模拟完整生命周期（App 若在 delegate 回调里发奖也能走通）
+        // 2) v7.6: ivar 遍历找 handler block（KVC 属性名对不上时）
+        id bh = rivoFindRewardHandlerInAd(ad);
+        if (bh) {
+            @try {
+                ((void (^)(id))bh)(rivoMakeReward());
+                rivoAppendLog(@"AD-BLOCK: 从广告对象 ivar 触发奖励 handler (ad=%@)", NSStringFromClass([ad class]));
+                return;
+            } @catch (NSException *e) {
+                rivoAppendLog(@"AD-BLOCK: ivar handler 调用异常 %@", e);
+            }
+        }
+        // 3) 找不到 handler → 模拟完整生命周期（App 若在 delegate 回调里发奖也能走通）
         rivoAppendLog(@"AD-BLOCK: 未找到 reward handler，模拟生命周期 (ad=%@)", NSStringFromClass([ad class]));
         rivoSimulateLifecycle(ad, YES);
     } @catch (NSException *e) {
@@ -531,16 +631,14 @@ static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) 
                 if (!ad) {
                     @try { ad = [vc valueForKey:@"ad"]; } @catch (NSException *e) {}
                 }
+                if (!ad) {
+                    // v7.6: KVC 拿不到 → ivar 遍历（含递归一层）
+                    ad = rivoFindRewardedAdInObject(vc);
+                }
                 if (ad) {
                     rivoTryRewardFromAd(ad);
                 } else {
-                    // 拿不到广告对象：对 VC 内部弱引用广告再试一次
-                    @try {
-                        for (NSString *k in @[@"fullScreenAd", @"rewardedAd", @"interstitialAd", @"ad"]) {
-                            id a2 = [vc valueForKey:k];
-                            if (a2) { rivoTryRewardFromAd(a2); break; }
-                        }
-                    } @catch (NSException *e) {}
+                    rivoAppendLog(@"AD-BLOCK: 兜底拦截但未找到广告对象 (vc=%@, ivars=%u)", cls, (unsigned int)class_getInstanceSize([vc class]));
                 }
             }
             return; // 广告不弹
@@ -925,6 +1023,16 @@ static void rivoDoHook(void) {
     if (mpv) {
         origPresentIMP = method_getImplementation(mpv);
         method_setImplementation(mpv, (IMP)rivoPresent);
+    }
+
+    // 4.6) v7.6: GADFullScreenAdViewController 兜底防护（present 漏网时 viewWillAppear 隐藏+发奖）
+    Class gFullVC = NSClassFromString(@"GADFullScreenAdViewController");
+    if (gFullVC) {
+        Method mv = class_getInstanceMethod(gFullVC, @selector(viewWillAppear:));
+        if (mv) {
+            origGADVCWillAppearIMP = method_getImplementation(mv);
+            method_setImplementation(mv, (IMP)rivoGADVCWillAppear);
+        }
     }
 
     // 5) 节点抓取：注册 NSURLProtocol
