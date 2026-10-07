@@ -486,27 +486,32 @@ static void rivoUnityShow(id self, SEL _cmd, NSString *placementId, id showDeleg
 // 万能兜底：任何广告 VC 通过 presentViewController 弹全屏时直接拦截
 static IMP origPresentIMP = NULL;
 
-// v7.6: 前置声明（rivoGADVCWillAppear 引用后面的函数）
+// v7.7: 前置声明（备用函数，GAD 已改放行+秒关方案）
 static id rivoFindRewardedAdInObject(id obj);
 static void rivoTryRewardFromAd(id ad);
 
-// v7.6: GADFullScreenAdViewController 兜底防护（present 拦截漏网时，viewWillAppear 隐藏+发奖）
-static IMP origGADVCWillAppearIMP = NULL;
+// v7.7: GAD 全屏广告出现后 0.4 秒自动关闭（触发 App 自身 dismiss 回调自然发奖，不手动调未知 block）
+static IMP origGADVCViewDidAppearIMP = NULL;
 
-static void rivoGADVCWillAppear(id self, SEL _cmd, BOOL animated) {
-    @try {
-        rivoAppendLog(@"AD-BLOCK: GADFullScreenAdViewController viewWillAppear 拦截");
-        if ([self respondsToSelector:@selector(view)]) {
-            UIView *v = [self valueForKey:@"view"];
-            v.hidden = YES;
-            v.userInteractionEnabled = NO;
-        }
-        id ad = rivoFindRewardedAdInObject(self);
-        if (ad) rivoTryRewardFromAd(ad);
-    } @catch (NSException *e) {}
-    if (origGADVCWillAppearIMP) {
-        ((void (*)(id, SEL, BOOL))origGADVCWillAppearIMP)(self, _cmd, animated);
+static void rivoGADVCViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (origGADVCViewDidAppearIMP) {
+        ((void (*)(id, SEL, BOOL))origGADVCViewDidAppearIMP)(self, _cmd, animated);
     }
+    rivoAppendLog(@"AD-BLOCK: GAD 广告已显示，0.4s 后自动关闭（模拟看完）");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try {
+            UIViewController *vc = self;
+            UIViewController *p = vc.presentingViewController;
+            if (p) {
+                [p dismissViewControllerAnimated:NO completion:nil];
+            } else {
+                [vc dismissViewControllerAnimated:NO completion:nil];
+            }
+            rivoAppendLog(@"AD-BLOCK: GAD 广告已 dismiss");
+        } @catch (NSException *e) {
+            rivoAppendLog(@"AD-BLOCK: dismiss 异常 %@", e);
+        }
+    });
 }
 
 // v7.6.1: 遍历对象 ivar 找 GADRewarded* 广告对象（带深度限制 + 防环，避免对象图循环引用导致栈溢出闪退）
@@ -559,6 +564,10 @@ static id rivoFindRewardedAdInObjectDepth(id obj, int depth) {
         return found;
     }
 }
+
+// v7.7: 以下函数已不再被调用（GAD 改放行+秒关方案），保留备用，加 unused 防 -Werror
+static id rivoFindRewardedAdInObject(id obj) __attribute__((unused));
+static void rivoTryRewardFromAd(id ad) __attribute__((unused));
 
 static id rivoFindRewardedAdInObject(id obj) {
     [rivoVisitedObjects() removeAllObjects]; // 每次调用清空 visited
@@ -645,31 +654,18 @@ static void rivoTryRewardFromAd(id ad) {
 static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) {
     @try {
         NSString *cls = vc ? NSStringFromClass([vc class]) : @"";
-        BOOL isAd = cls.length > 0 && (
-            [cls hasPrefix:@"GAD"] || [cls hasPrefix:@"UnityAds"] ||
-            [cls hasPrefix:@"Vungle"] || [cls hasPrefix:@"Liftoff"] ||
+        // v7.7: GAD 广告一律放行（PRO 时长依赖 AdMob 完整流程，显示后由 viewDidAppear 秒关触发自然发奖）
+        BOOL isGAD = cls.length > 0 && [cls hasPrefix:@"GAD"];
+        BOOL isAd = cls.length > 0 && !isGAD && (
+            [cls hasPrefix:@"UnityAds"] || [cls hasPrefix:@"Vungle"] || [cls hasPrefix:@"Liftoff"] ||
             [cls containsString:@"Interstitial"] || [cls containsString:@"Rewarded"] ||
             [cls containsString:@"AppOpen"]);
         if (isAd) {
             rivoAppendLog(@"AD-BLOCK: presentViewController 兜底拦截 %@", cls);
-            // v7.5: 若 vc 是 GAD 全屏广告内部 VC，回溯广告对象发奖励/模拟生命周期（解决 PRO 转圈）
-            if ([cls hasPrefix:@"GAD"]) {
-                id ad = nil;
-                @try { ad = [vc valueForKey:@"fullScreenAd"]; } @catch (NSException *e) {}
-                if (!ad) {
-                    @try { ad = [vc valueForKey:@"ad"]; } @catch (NSException *e) {}
-                }
-                if (!ad) {
-                    // v7.6: KVC 拿不到 → ivar 遍历（含递归一层）
-                    ad = rivoFindRewardedAdInObject(vc);
-                }
-                if (ad) {
-                    rivoTryRewardFromAd(ad);
-                } else {
-                    rivoAppendLog(@"AD-BLOCK: 兜底拦截但未找到广告对象 (vc=%@, ivars=%u)", cls, (unsigned int)class_getInstanceSize([vc class]));
-                }
-            }
             return; // 广告不弹
+        }
+        if (isGAD) {
+            rivoAppendLog(@"AD-BLOCK: GAD 广告放行（%s）由 viewDidAppear 秒关", cls.UTF8String);
         }
     } @catch (NSException *e) {
         rivoAppendLog(@"AD-BLOCK: rivoPresent 异常 %@", e);
@@ -1053,13 +1049,13 @@ static void rivoDoHook(void) {
         method_setImplementation(mpv, (IMP)rivoPresent);
     }
 
-    // 4.6) v7.6: GADFullScreenAdViewController 兜底防护（present 漏网时 viewWillAppear 隐藏+发奖）
+    // 4.6) v7.7: GADFullScreenAdViewController 显示后 0.4s 自动关闭（模拟看完→自然发奖）
     Class gFullVC = NSClassFromString(@"GADFullScreenAdViewController");
     if (gFullVC) {
-        Method mv = class_getInstanceMethod(gFullVC, @selector(viewWillAppear:));
+        Method mv = class_getInstanceMethod(gFullVC, @selector(viewDidAppear:));
         if (mv) {
-            origGADVCWillAppearIMP = method_getImplementation(mv);
-            method_setImplementation(mv, (IMP)rivoGADVCWillAppear);
+            origGADVCViewDidAppearIMP = method_getImplementation(mv);
+            method_setImplementation(mv, (IMP)rivoGADVCViewDidAppear);
         }
     }
 
