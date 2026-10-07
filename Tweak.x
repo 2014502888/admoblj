@@ -651,6 +651,17 @@ static void rivoTryRewardFromAd(id ad) {
     }
 }
 
+static UIViewController *rivoTopPresentedVC(void) {
+    UIWindow *w = nil;
+    for (UIWindow *ww in [UIApplication sharedApplication].windows) {
+        if (ww.rootViewController) { w = ww; break; }
+    }
+    if (!w) w = [UIApplication sharedApplication].keyWindow;
+    UIViewController *top = w.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    return top;
+}
+
 static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) {
     @try {
         NSString *cls = vc ? NSStringFromClass([vc class]) : @"";
@@ -665,7 +676,30 @@ static void rivoPresent(id self, SEL _cmd, id vc, BOOL animated, id completion) 
             return; // 广告不弹
         }
         if (isGAD) {
-            rivoAppendLog(@"AD-BLOCK: GAD 广告放行（%s）由 viewDidAppear 秒关", cls.UTF8String);
+            rivoAppendLog(@"AD-BLOCK: GAD 广告放行（%s）0.4s 后自动关闭", cls.UTF8String);
+            // v7.8: 不再依赖 viewDidAppear（GADFullScreenAdViewController 未自己实现该方法，
+            // class_getInstanceMethod 拿不到，hook 注册失败）→ 直接在放行后从 keyWindow
+            // 找顶层 presentedViewController（类名含 GAD）并 dismiss，让 App 自身 dismiss 回调自然发奖。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                @try {
+                    UIViewController *top = rivoTopPresentedVC();
+                    NSString *topCls = top ? NSStringFromClass([top class]) : @"";
+                    rivoAppendLog(@"AD-BLOCK: 0.4s 后顶层 VC = %@", topCls);
+                    if (top && [topCls hasPrefix:@"GAD"]) {
+                        [top dismissViewControllerAnimated:NO completion:^{
+                            rivoAppendLog(@"AD-BLOCK: GAD 广告已 dismiss，等待 App 发奖");
+                        }];
+                    } else if (top) {
+                        // 类名不含 GAD 但确实是广告容器（SwiftUI 包装等），兜底也关
+                        if ([topCls containsString:@"FullScreen"] || [topCls containsString:@"Ad"]) {
+                            [top dismissViewControllerAnimated:NO completion:nil];
+                            rivoAppendLog(@"AD-BLOCK: 兜底 dismiss %@", topCls);
+                        }
+                    }
+                } @catch (NSException *e) {
+                    rivoAppendLog(@"AD-BLOCK: 自动关闭异常 %@", e);
+                }
+            });
         }
     } @catch (NSException *e) {
         rivoAppendLog(@"AD-BLOCK: rivoPresent 异常 %@", e);
@@ -1049,13 +1083,24 @@ static void rivoDoHook(void) {
         method_setImplementation(mpv, (IMP)rivoPresent);
     }
 
-    // 4.6) v7.7: GADFullScreenAdViewController 显示后 0.4s 自动关闭（模拟看完→自然发奖）
+    // 4.6) v7.8: GAD 秒关已改由 rivoPresent 延迟 dismiss 承担（viewDidAppear hook 仅在
+    // GADFullScreenAdViewController 自身实现该方法时才注册——避免替换到父类 UIViewController
+    // 的实现而影响所有正常页面）
     Class gFullVC = NSClassFromString(@"GADFullScreenAdViewController");
     if (gFullVC) {
-        Method mv = class_getInstanceMethod(gFullVC, @selector(viewDidAppear:));
-        if (mv) {
-            origGADVCViewDidAppearIMP = method_getImplementation(mv);
-            method_setImplementation(mv, (IMP)rivoGADVCViewDidAppear);
+        BOOL ownMethod = NO;
+        unsigned int mc = 0;
+        Method *ml = class_copyMethodList(gFullVC, &mc);
+        for (unsigned int i = 0; i < mc; i++) {
+            if (method_getName(ml[i]) == @selector(viewDidAppear:)) { ownMethod = YES; break; }
+        }
+        if (ml) free(ml);
+        if (ownMethod) {
+            Method mv = class_getInstanceMethod(gFullVC, @selector(viewDidAppear:));
+            if (mv) {
+                origGADVCViewDidAppearIMP = method_getImplementation(mv);
+                method_setImplementation(mv, (IMP)rivoGADVCViewDidAppear);
+            }
         }
     }
 
