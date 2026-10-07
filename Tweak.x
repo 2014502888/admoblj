@@ -509,52 +509,68 @@ static void rivoGADVCWillAppear(id self, SEL _cmd, BOOL animated) {
     }
 }
 
-// v7.6: 遍历对象 ivar 找 GADRewarded* 广告对象（KVC 属性名不可靠，ivar 一定在）
-static id rivoFindRewardedAdInObject(id obj) {
-    if (!obj) return nil;
-    Class cls = [obj class];
-    NSString *clsName = NSStringFromClass(cls);
-    if ([clsName containsString:@"Rewarded"]) return obj; // 对象本身就是激励广告
-    unsigned int count = 0;
-    Ivar *ivars = class_copyIvarList(cls, &count);
-    id found = nil;
-    for (unsigned int i = 0; i < count && !found; i++) {
-        Ivar iv = ivars[i];
-        @try {
-            id val = object_getIvar(obj, iv);
-            if (!val) continue;
-            NSString *vcls = NSStringFromClass([val class]);
-            // 值类名含 Rewarded 的 ivar 就是激励广告对象（可能嵌一层：全屏 VC -> 广告）
-            if ([vcls containsString:@"Rewarded"] || [vcls containsString:@"GADFullScreenAd"]) {
-                found = val;
-                break;
-            }
-        } @catch (NSException *e) {}
-    }
-    free(ivars);
-    // 递归一层：某些对象是包装器，广告在它的 ivar 里
-    if (!found && count > 0) {
-        for (unsigned int i = 0; i < count; i++) {
+// v7.6.1: 遍历对象 ivar 找 GADRewarded* 广告对象（带深度限制 + 防环，避免对象图循环引用导致栈溢出闪退）
+static NSMutableSet *rivoVisitedObjects(void) {
+    static NSMutableSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
+    return s;
+}
+
+static id rivoFindRewardedAdInObjectDepth(id obj, int depth) {
+    if (!obj || depth > 3) return nil; // 最多 3 层，防无限递归
+    NSMutableSet *visited = rivoVisitedObjects();
+    if ([visited containsObject:obj]) return nil; // 防环
+    [visited addObject:obj];
+    @autoreleasepool {
+        Class cls = [obj class];
+        NSString *clsName = NSStringFromClass(cls);
+        if ([clsName containsString:@"Rewarded"]) return obj; // 对象本身就是激励广告
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        id found = nil;
+        for (unsigned int i = 0; i < count && !found; i++) {
             Ivar iv = ivars[i];
             @try {
                 id val = object_getIvar(obj, iv);
-                if (val) {
-                    id inner = rivoFindRewardedAdInObject(val);
-                    if (inner) { found = inner; break; }
+                if (!val) continue;
+                NSString *vcls = NSStringFromClass([val class]);
+                // 值类名含 Rewarded 的 ivar 就是激励广告对象（可能嵌一层：全屏 VC -> 广告）
+                if ([vcls containsString:@"Rewarded"] || [vcls containsString:@"GADFullScreenAd"]) {
+                    found = val;
+                    break;
                 }
             } @catch (NSException *e) {}
         }
+        if (!found) {
+            // 递归：某些对象是包装器，广告在它的 ivar 里
+            for (unsigned int i = 0; i < count; i++) {
+                Ivar iv = ivars[i];
+                @try {
+                    id val = object_getIvar(obj, iv);
+                    if (val) {
+                        id inner = rivoFindRewardedAdInObjectDepth(val, depth + 1);
+                        if (inner) { found = inner; break; }
+                    }
+                } @catch (NSException *e) {}
+            }
+        }
+        free(ivars);
+        return found;
     }
-    return found;
 }
 
-// v7.6: 遍历广告对象 ivar 找 reward handler block（类型 @"@?"，名字含 reward 优先）
+static id rivoFindRewardedAdInObject(id obj) {
+    [rivoVisitedObjects() removeAllObjects]; // 每次调用清空 visited
+    return rivoFindRewardedAdInObjectDepth(obj, 0);
+}
+
+// v7.6.1: 遍历广告对象 ivar 找 reward handler block（只认名字明确含 reward 的，绝不盲目调第一个 block）
 static id rivoFindRewardHandlerInAd(id ad) {
     if (!ad) return nil;
     unsigned int count = 0;
     Ivar *ivars = class_copyIvarList([ad class], &count);
     id handler = nil;
-    id firstBlock = nil;
     for (unsigned int i = 0; i < count; i++) {
         Ivar iv = ivars[i];
         @try {
@@ -563,7 +579,6 @@ static id rivoFindRewardHandlerInAd(id ad) {
             if ([type hasPrefix:@"@?"]) { // block
                 id val = object_getIvar(ad, iv);
                 if (!val) continue;
-                if (!firstBlock) firstBlock = val;
                 if ([name rangeOfString:@"reward" options:NSCaseInsensitiveSearch].location != NSNotFound) {
                     handler = val;
                     break;
@@ -572,7 +587,20 @@ static id rivoFindRewardHandlerInAd(id ad) {
         } @catch (NSException *e) {}
     }
     free(ivars);
-    return handler ?: firstBlock;
+    return handler; // v7.6.1: 只认名字含 reward 的 block，绝不盲目调用任意 block
+}
+
+// v7.6.1: block 类型校验（block 对象的 isa 链含 NSBlock，非 block 调用会崩）
+static BOOL rivoIsBlock(id obj) {
+    if (!obj) return NO;
+    Class blockClass = objc_getClass("NSBlock");
+    if (!blockClass) return NO;
+    Class cls = object_getClass(obj);
+    while (cls) {
+        if (cls == blockClass) return YES;
+        cls = class_getSuperclass(cls);
+    }
+    return NO;
 }
 
 // v7.5: 从广告 VC 回溯广告对象并触发奖励（PRO 走 GADFullScreenAdViewController 内部 VC 时用）
@@ -585,7 +613,7 @@ static void rivoTryRewardFromAd(id ad) {
         for (NSString *k in handlerKeys) {
             id h = nil;
             @try { h = [ad valueForKey:k]; } @catch (NSException *e) {}
-            if (h) {
+            if (h && rivoIsBlock(h)) { // v7.6.1: 必须真 block 才调（非 block 调用会崩）
                 @try {
                     ((void (^)(id))h)(rivoMakeReward());
                     rivoAppendLog(@"AD-BLOCK: 从广告对象触发奖励 handler (key=%@, ad=%@)", k, NSStringFromClass([ad class]));
@@ -597,7 +625,7 @@ static void rivoTryRewardFromAd(id ad) {
         }
         // 2) v7.6: ivar 遍历找 handler block（KVC 属性名对不上时）
         id bh = rivoFindRewardHandlerInAd(ad);
-        if (bh) {
+        if (bh && rivoIsBlock(bh)) {
             @try {
                 ((void (^)(id))bh)(rivoMakeReward());
                 rivoAppendLog(@"AD-BLOCK: 从广告对象 ivar 触发奖励 handler (ad=%@)", NSStringFromClass([ad class]));
