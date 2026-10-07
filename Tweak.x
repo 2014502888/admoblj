@@ -8,6 +8,12 @@
 #import <mach/mach_vm.h>
 #include "fishhook.h"
 
+// v7.2: Theos 部分 SDK 环境下 <mach/mach_vm.h> 的 mach_vm_read 声明不可见，
+// 手动补原型（与头文件重复声明合法，编译/链接均无冲突）
+extern kern_return_t mach_vm_read(vm_map_t target_task, mach_vm_address_t address,
+                                  mach_vm_size_t size, vm_offset_t *data,
+                                  mach_msg_type_number_t *dataCnt);
+
 // ===== RivoVPNAD v7: 广告展示层拦截（激励广告跳过展示直接发奖励）+ 节点抓取 =====
 // v7 变更：
 //   - 定位到"点连接后全屏广告+进度条"= 激励广告（AdMob Rewarded / UnityAds show）在展示层弹出，
