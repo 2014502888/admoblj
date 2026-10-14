@@ -22,9 +22,7 @@ jobs:
           export THEOS=$HOME/theos
           make FINALPACKAGE=1
           mkdir -p out
-          find .theos -name '*.dylib' | while read f; do
-            lipo -thin arm64 "$f" -output "out/$(basename "$f")"
-          done
+          find .theos -name '*.dylib' -exec cp {} out/ \;
           ls -la out/
 
       - name: Upload dylib
