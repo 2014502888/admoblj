@@ -1,4 +1,4 @@
-name: Build RivoVPNAD
+name: Build dylib
 
 on:
   push:
@@ -7,31 +7,29 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install theos
+      - name: Install THEOS and deps
         run: |
-          sudo mkdir -p /opt/theos
-          sudo chown "$USER" /opt/theos
-          git clone --recursive https://github.com/theos/theos.git /opt/theos
+          brew install ldid
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Install ldid
+      - name: Build dylib (Theos, thin arm64)
         run: |
-          brew install ldid || brew install ldid-procursus
+          export THEOS=$HOME/theos
+          make FINALPACKAGE=1
+          mkdir -p out
+          find .theos -name '*.dylib' | while read f; do
+            lipo -thin arm64 "$f" -output "out/$(basename "$f")"
+          done
+          ls -la out/
 
-      - name: Build dylib
-        env:
-          THEOS: /opt/theos
-          THEOS_PACKAGE_SCHEME: rootless
-        run: |
-          make
-
-      - name: Upload artifact
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: RivoVPNAD-dylib
-          path: |
-            .theos/obj/debug/arm64/RivoVPNAD.dylib
+          path: out/*.dylib
+          if-no-files-found: error
