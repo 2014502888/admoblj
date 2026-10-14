@@ -22,7 +22,8 @@ jobs:
           export THEOS=$HOME/theos
           make FINALPACKAGE=1
           mkdir -p out
-          find .theos -name '*.dylib' -exec cp {} out/ \;
+          find .theos \( -name '*.dSYM' -o -path '*/dSYM/*' \) -prune -o -name '*.dylib' -exec cp {} out/ \;
+          file out/*.dylib
           ls -la out/
 
       - name: Upload dylib
